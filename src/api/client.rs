@@ -22,7 +22,11 @@ use crate::http::Http;
 const BASE_URL: &str = "https://api.spotify.com/v1";
 const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
+/// The longest Retry-After a request waits out before trying again; a
+/// longer cooldown fails requests until it ends.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The longest cooldown recorded, so a nonsense header cannot overflow.
+const MAX_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -369,19 +373,22 @@ impl ApiClient {
             .ok_or(ApiError::NotSignedIn)
     }
 
-    async fn wait_for_cooldown(&self) {
+    async fn wait_for_cooldown(&self) -> Result<()> {
         loop {
             let until = *self.cooldown_until.lock().await;
             let Some(wait) = until.checked_duration_since(Instant::now()) else {
-                return;
+                return Ok(());
             };
+            if wait > MAX_RETRY_AFTER {
+                return Err(ApiError::RateLimited);
+            }
             tokio::time::sleep(wait).await;
         }
     }
 
     async fn extend_cooldown(&self, wait: Duration) {
         let mut until = self.cooldown_until.lock().await;
-        *until = (*until).max(Instant::now() + wait);
+        *until = (*until).max(Instant::now() + wait.min(MAX_COOLDOWN));
     }
 
     // ---- transport -------------------------------------------------------
@@ -424,7 +431,7 @@ impl ApiClient {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            self.wait_for_cooldown().await;
+            self.wait_for_cooldown().await?;
             let permit = self
                 .limiter
                 .acquire()
@@ -461,8 +468,7 @@ impl ApiClient {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok())
-                    .map_or(Duration::from_secs(1), Duration::from_secs)
-                    .min(MAX_RETRY_AFTER);
+                    .map_or(Duration::from_secs(1), Duration::from_secs);
                 let text = response.text().await.unwrap_or_default();
                 if is_quota_exhausted(&text) {
                     return Err(ApiError::QuotaExhausted);
@@ -1288,6 +1294,75 @@ mod tests {
         assert!(!is_quota_exhausted(
             r#"{"error":{"status":429,"message":"Too many requests"}}"#
         ));
+    }
+
+    #[tokio::test]
+    async fn a_long_retry_after_is_honoured_without_probing_spotify() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let probe = listener.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0; 1024];
+            while !received.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                received.extend_from_slice(&buffer[..count]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let http = reqwest::Client::new();
+        let mut client = ApiClient::new(
+            http.clone(),
+            Arc::new(NetActivity::default()),
+            20,
+            50,
+            ApiSource::Shared,
+        );
+        client.base_url = Some(format!("http://{address}"));
+        client.set_token_provider(Some(TokenProvider::Web(WebTokens::new(
+            http,
+            crate::auth::StoredToken {
+                access_token: "test-only".into(),
+                expires_at: u64::MAX,
+                ..Default::default()
+            },
+            crate::credentials::Store::in_memory(crate::paths::AppDirs {
+                config: std::env::temp_dir().join("unused-retry-token/config"),
+                state: std::env::temp_dir().join("unused-retry-token/state"),
+                cache: std::env::temp_dir().join("unused-retry-token/cache"),
+            })
+            .lease(crate::credentials::Slot::Shared),
+            ApiSource::Shared,
+            Arc::new(|_| {}),
+        ))));
+
+        for _ in 0..2 {
+            let result = tokio::time::timeout(Duration::from_secs(5), client.me())
+                .await
+                .expect("a long cooldown fails at once instead of sleeping");
+            assert!(matches!(result, Err(ApiError::RateLimited)));
+        }
+        server.join().unwrap();
+        assert!(
+            *client.cooldown_until.lock().await > Instant::now() + Duration::from_secs(3500),
+            "the whole cooldown is remembered"
+        );
+        probe.set_nonblocking(true).unwrap();
+        assert_eq!(
+            probe.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no request reached Spotify during the cooldown"
+        );
     }
 
     #[tokio::test]

@@ -603,16 +603,56 @@ impl Sink for RodioSink {
         output.last_write = Some(now);
         // Let rodio drain a little; without this the whole track would be
         // decoded into memory at once.
-        while output.sink.len() > QUEUE_LIMIT {
-            if output.failed() {
-                let message = "The audio output stopped working".to_string();
-                (self.on_error)(message.clone());
-                return Err(SinkError::OnWrite(message));
+        if let Err(stall) = wait_for_room(|| output.sink.len(), || output.failed(), DRAIN_TIMEOUT) {
+            let message = match stall {
+                Stall::Failed => "The audio output stopped working",
+                Stall::Stuck => "The audio output stopped taking sound",
             }
-            thread::sleep(Duration::from_millis(10));
+            .to_string();
+            if stall == Stall::Stuck {
+                log::warn!("the audio output took nothing for {DRAIN_TIMEOUT:?}; reopening it");
+                // The next write or start opens the output again.
+                output.failed.store(true, Ordering::Relaxed);
+            }
+            (self.on_error)(message.clone());
+            return Err(SinkError::OnWrite(message));
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stall {
+    /// The output reported an error.
+    Failed,
+    /// The queue did not shrink for the whole timeout: a device that stopped
+    /// pulling audio without reporting an error.
+    Stuck,
+}
+
+/// Waits until at most `QUEUE_LIMIT` chunks are queued.
+fn wait_for_room(
+    queued: impl Fn() -> usize,
+    failed: impl Fn() -> bool,
+    timeout: Duration,
+) -> Result<(), Stall> {
+    let mut length = queued();
+    let mut progressed = Instant::now();
+    while length > QUEUE_LIMIT {
+        if failed() {
+            return Err(Stall::Failed);
+        }
+        if progressed.elapsed() >= timeout {
+            return Err(Stall::Stuck);
+        }
+        thread::sleep(Duration::from_millis(10));
+        let now = queued();
+        if now < length {
+            progressed = Instant::now();
+        }
+        length = now;
+    }
+    Ok(())
 }
 
 /// Opens the stream at Spotify's stereo 44.1 kHz, so nothing is converted,
@@ -795,6 +835,40 @@ fn open_output(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stalled_output_ends_the_wait_and_a_draining_one_does_not() {
+        use super::{QUEUE_LIMIT, Stall, wait_for_room};
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        assert_eq!(
+            wait_for_room(|| QUEUE_LIMIT + 1, || false, Duration::from_millis(50)),
+            Err(Stall::Stuck)
+        );
+        assert_eq!(
+            wait_for_room(|| QUEUE_LIMIT + 1, || true, Duration::from_secs(5)),
+            Err(Stall::Failed)
+        );
+        // Slow but steady draining outlasts the timeout without failing.
+        // About 50 ms per chunk for about two seconds, against a 1 s timeout.
+        let length = Cell::new(QUEUE_LIMIT + 40);
+        let calls = Cell::new(0);
+        let queued = || {
+            calls.set(calls.get() + 1);
+            if calls.get() % 5 == 0 {
+                length.set(length.get() - 1);
+            }
+            length.get()
+        };
+        assert_eq!(
+            wait_for_room(queued, || false, Duration::from_secs(1)),
+            Ok(())
+        );
+        assert_eq!(
+            wait_for_room(|| QUEUE_LIMIT, || false, Duration::ZERO),
+            Ok(())
+        );
+    }
 
     /// Converts the configured buffer duration to device frames.
     #[test]
