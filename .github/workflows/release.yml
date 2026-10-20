@@ -9,6 +9,20 @@ on:
         type: boolean
         required: false
         default: false
+    # Only these are passed from CI. Missing Apple values select ad-hoc signing.
+    secrets:
+      APPLE_CERTIFICATE_BASE64:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      APPLE_ID:
+        required: false
+      APPLE_APP_SPECIFIC_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
   workflow_dispatch:
 
 permissions:
@@ -37,13 +51,13 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Verify caller and current main
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           PUBLISH: ${{ inputs.publish }}
           TARGET_SHA: ${{ github.sha }}
@@ -104,22 +118,24 @@ jobs:
       CMAKE_GENERATOR: Ninja
       VERSION: ${{ needs.identity.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.identity.outputs.sha }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      # Signing secrets reach later steps in this job, so the toolchain comes
+      # from the runner's rustup and rust-toolchain.toml, and no shared cache
+      # is restored into the build.
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install --no-self-update
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup show active-toolchain
       - name: Stamp the ephemeral build version
         run: |
           python3 packaging/release.py stamp "$VERSION"
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: spotidark-macos-universal
 
       - name: Select signing mode
         id: signing
@@ -248,7 +264,7 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/spotidark-signing.keychain-db" >/dev/null 2>&1 || true
           rm -f "$RUNNER_TEMP/spotidark-cert.p12" "$RUNNER_TEMP/spotidark-app-notary.zip"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spotidark-macos
           path: dist/spotidark-macos.dmg
@@ -263,15 +279,18 @@ jobs:
       CMAKE_GENERATOR: Ninja
       VERSION: ${{ needs.identity.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.identity.outputs.sha }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - run: rustup target add x86_64-pc-windows-msvc
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install --no-self-update
+          rustup target add x86_64-pc-windows-msvc
+          rustup show active-toolchain
       - name: Stamp the ephemeral build version
         shell: bash
         run: |
@@ -280,10 +299,7 @@ jobs:
       - name: GLEW for libprojectM
         run: vcpkg install glew:x64-windows-static
       - name: MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: spotidark-windows-x64
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Select signing mode
         id: signing
@@ -391,7 +407,7 @@ jobs:
         shell: bash
         run: python3 packaging/release.py verify-assets dist spotidark-windows.exe
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: spotidark-windows
           path: dist/spotidark-windows.exe
@@ -413,23 +429,23 @@ jobs:
       RELEASE_VERSION: ${{ needs.identity.outputs.version }}
       MACOS_SIGNING_MODE: ${{ needs.macos.outputs.signing_mode }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.identity.outputs.sha }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: spotidark-macos
           path: dist
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: spotidark-windows
           path: dist
 
       - name: Verify publication state
         id: state
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           RELEASE_SHA: ${{ needs.identity.outputs.sha }}
           RELEASE_TAG: ${{ needs.identity.outputs.tag }}
@@ -519,7 +535,7 @@ jobs:
             --draft
 
       - name: Verify uploaded bytes and publish current main
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           RELEASE_SHA: ${{ needs.identity.outputs.sha }}
           RELEASE_TAG: ${{ needs.identity.outputs.tag }}
@@ -595,7 +611,7 @@ jobs:
             });
 
       - name: Verify published tag, latest release, and prune prior Spotidark versions
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           RELEASE_SHA: ${{ needs.identity.outputs.sha }}
           RELEASE_TAG: ${{ needs.identity.outputs.tag }}

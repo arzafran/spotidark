@@ -828,6 +828,8 @@ impl Backend {
             })
         };
         let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
+        let lyrics_cache = dirs.lyrics_cache_dir();
+        runtime.spawn_blocking(move || crate::lyrics::trim_cache(&lyrics_cache));
         let activity = Arc::new(NetActivity::default());
 
         let worker_activity = Arc::clone(&activity);
@@ -1050,10 +1052,30 @@ impl Backend {
 
     pub fn shutdown(&mut self) {
         self.send(Command::Shutdown);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && !join_within(thread, BACKEND_SHUTDOWN_TIMEOUT)
+        {
+            log::warn!("the backend did not stop in time; exiting without it");
         }
     }
+}
+
+/// How long quitting waits for the backend thread. It covers the cache
+/// flush and the runtime's own two-second shutdown.
+const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Joins `thread` if it ends within `timeout`; otherwise leaves it running
+/// and returns false.
+fn join_within(thread: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = thread.join();
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1176,6 +1198,7 @@ struct Worker {
     resume: Option<LoadSpec>,
     /// A pickup in flight: the load to repeat and how often it was tried.
     resume_verify: Option<(LoadSpec, u8)>,
+    cache_writes: CacheWrites,
 }
 
 impl Worker {
@@ -1229,6 +1252,7 @@ impl Worker {
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
+            cache_writes: CacheWrites::default(),
         }
     }
 
@@ -1464,7 +1488,10 @@ impl Worker {
                         waker.wake();
                     });
                 }
-                Command::Shutdown => break,
+                Command::Shutdown => {
+                    self.cache_writes.finish(CACHE_FLUSH_TIMEOUT).await;
+                    break;
+                }
                 Command::SignIn { request, config } => self.change_proxy(request, config, true),
                 Command::CancelSignIn => {
                     self.authorization_attempt += 1;
@@ -1691,10 +1718,7 @@ impl Worker {
                     items,
                     total,
                     next_offset,
-                } => {
-                    self.store_playlist_cache(id, snapshot, items, total, next_offset)
-                        .await
-                }
+                } => self.store_playlist_cache(id, snapshot, items, total, next_offset),
                 Command::UserNames(ids) => self.fetch_user_names(ids),
                 Command::LoadLikedSongsCache { generation } => {
                     if let Some(account) = self.api.account() {
@@ -1720,9 +1744,11 @@ impl Worker {
                         .is_some_and(|account| account.as_str() == cache.account_id)
                     {
                         let path = self.dirs.liked_songs_cache_file(&cache.account_id);
-                        if let Err(error) = crate::liked::write(&path, &cache).await {
-                            log::warn!("unable to store Liked Songs cache: {error}");
-                        }
+                        self.cache_writes.spawn(path.clone(), async move {
+                            if let Err(error) = crate::liked::write(&path, cache).await {
+                                log::warn!("unable to store Liked Songs cache: {error}");
+                            }
+                        });
                     }
                 }
                 Command::AlbumTypes(uris) => self.fetch_album_types(uris),
@@ -2606,6 +2632,9 @@ impl Worker {
                     .map_err(|error| error.to_string())?;
                 let info = crate::zeroconf::get_info(&http, &receiver)
                     .map_err(|error| error.to_string())?;
+                if !crate::zeroconf::same_device(&receiver, &info) {
+                    return Err("A different device now answers at this receiver's address. Search for receivers again.".into());
+                }
                 if !lease.current() {
                     return Err("Sign-in changed before receiver activation.".into());
                 }
@@ -2796,8 +2825,8 @@ impl Worker {
         });
     }
 
-    async fn store_playlist_cache(
-        &self,
+    fn store_playlist_cache(
+        &mut self,
         id: String,
         snapshot: String,
         items: Vec<PlaylistItem>,
@@ -2817,9 +2846,11 @@ impl Worker {
             total: Some(total),
             next_offset,
         };
-        if let Err(error) = write_cached_playlist(path.clone(), cached).await {
-            log::warn!("unable to store playlist cache {}: {error}", path.display());
-        }
+        self.cache_writes.spawn(path.clone(), async move {
+            if let Err(error) = write_cached_playlist(path.clone(), cached).await {
+                log::warn!("unable to store playlist cache {}: {error}", path.display());
+            }
+        });
     }
 
     /// Ask Spotify who is behind each user id. Only the streaming session
@@ -3588,12 +3619,51 @@ async fn read_cached_playlist(path: std::path::PathBuf) -> std::io::Result<Cache
     .map_err(std::io::Error::other)?
 }
 
+/// How long shutdown waits for queued cache writes to land.
+const CACHE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Cache file writes running off the command loop. Writes to one file run
+/// one after another in the order they were queued, so an older checkpoint
+/// never replaces a newer one.
+#[derive(Default)]
+struct CacheWrites(std::collections::HashMap<std::path::PathBuf, tokio::task::JoinHandle<()>>);
+
+impl CacheWrites {
+    fn spawn(
+        &mut self,
+        path: std::path::PathBuf,
+        write: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.0.retain(|_, write| !write.is_finished());
+        let previous = self.0.remove(&path);
+        let write = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            write.await;
+        });
+        self.0.insert(path, write);
+    }
+
+    /// Waits up to `timeout` for every queued write.
+    async fn finish(&mut self, timeout: Duration) {
+        let writes = std::mem::take(&mut self.0);
+        let all = async {
+            for (_, write) in writes {
+                let _ = write.await;
+            }
+        };
+        if tokio::time::timeout(timeout, all).await.is_err() {
+            log::warn!("cache writes were still running at shutdown");
+        }
+    }
+}
+
 async fn write_cached_playlist(
     path: std::path::PathBuf,
     cached: CachedPlaylist,
 ) -> std::io::Result<()> {
     // Move the checkpoint into the file worker without another model clone.
-    // Awaiting it preserves checkpoint order, including after playlist edits.
     tokio::task::spawn_blocking(move || write_cached_playlist_file(&path, &cached))
         .await
         .map_err(std::io::Error::other)?
@@ -3741,8 +3811,27 @@ mod album_type_lookup_tests {
 }
 
 #[cfg(test)]
+mod shutdown_tests {
+    use super::{Duration, join_within};
+
+    #[test]
+    fn shutdown_does_not_wait_forever_for_a_stuck_thread() {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = stopped.recv();
+        });
+        assert!(!join_within(stuck, Duration::from_millis(50)));
+        drop(stop);
+        let done = std::thread::spawn(|| {});
+        assert!(join_within(done, Duration::from_secs(5)));
+    }
+}
+
+#[cfg(test)]
 mod playlist_cache_tests {
-    use super::{CachedPlaylist, read_cached_playlist, write_cached_playlist};
+    use super::{
+        CacheWrites, CachedPlaylist, Duration, read_cached_playlist, write_cached_playlist,
+    };
     use crate::api::models::{PlayableItem, PlaylistItem, Track};
 
     #[test]
@@ -3830,6 +3919,43 @@ mod playlist_cache_tests {
         let text = tokio::fs::read_to_string(&path).await.unwrap();
         let stored: CachedPlaylist = serde_json::from_str(&text).unwrap();
         assert_eq!(stored.snapshot, "second");
+        assert!(!path.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_writes_to_one_file_land_in_order() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-playlist-cache-order-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = root.join("playlist.json");
+        let mut writes = CacheWrites::default();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        // The first write is still running when the next ones are queued.
+        writes.spawn(path.clone(), async move {
+            let _ = held.await;
+        });
+        for snapshot in ["first", "second", "third"] {
+            let path = path.clone();
+            let cached = CachedPlaylist {
+                snapshot: snapshot.into(),
+                items: Vec::new(),
+                total: Some(0),
+                next_offset: None,
+            };
+            writes.spawn(path.clone(), async move {
+                write_cached_playlist(path, cached).await.unwrap();
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!path.exists(), "nothing jumps the queue");
+        release.send(()).unwrap();
+        writes.finish(Duration::from_secs(5)).await;
+
+        let stored = read_cached_playlist(path.clone()).await.unwrap();
+        assert_eq!(stored.snapshot, "third");
         assert!(!path.with_extension("json.tmp").exists());
         let _ = std::fs::remove_dir_all(root);
     }

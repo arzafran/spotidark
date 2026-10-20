@@ -35,7 +35,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         .settings
         .motion
         .reduced(crate::util::system_reduced_motion());
-    app.lyrics_reduce_motion = reduced;
+    app.motion_reduced = reduced;
     theme::set_motion_reduced(ctx, reduced);
     keys::handle(app, ctx);
     for path in winamp::dropped_skins(ctx) {

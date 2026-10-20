@@ -197,7 +197,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, connecting: bool) {
             footer_ui.add_space((footer.width() - credit_width).max(0.0) / 2.0);
             if theme::link(&mut footer_ui, credit, font, palette.dim).clicked() {
                 ctx.open_url(egui::OpenUrl::new_tab(
-                    "https://github.com/crmne/spotifast",
+                    "https://github.com/darkroomengineering/spotidark",
                 ));
             }
         });

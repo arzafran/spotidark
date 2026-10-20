@@ -26,6 +26,9 @@ use crate::http::Http;
 /// Size-based eviction keeps visible images stable.
 const HELD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+/// The artwork disk cache is trimmed, oldest first, to this many bytes when
+/// a loader starts.
+const DISK_CACHE_CAP: u64 = 512 * 1024 * 1024;
 const FETCH_JOBS: usize = 4;
 const DECODE_JOBS: usize = 2;
 const PENDING_ART: usize = 32;
@@ -95,6 +98,10 @@ pub struct ArtLoader {
 impl ArtLoader {
     pub fn new(http: impl Into<Http>, runtime: tokio::runtime::Handle, cache_dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
+        runtime.spawn_blocking({
+            let cache_dir = cache_dir.clone();
+            move || trim_disk_cache(&cache_dir, DISK_CACHE_CAP)
+        });
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(HashMap::new()),
@@ -402,6 +409,16 @@ impl Inner {
         {
             entry.bytes = None;
         }
+    }
+}
+
+/// Deletes the least recently written artwork until the disk cache fits
+/// `cap`. Blocking.
+fn trim_disk_cache(cache_dir: &std::path::Path, cap: u64) {
+    match crate::util::trim_dir_to(cache_dir, cap) {
+        Ok(0) => {}
+        Ok(freed) => log::info!("trimmed {freed} bytes from the artwork cache"),
+        Err(error) => log::warn!("could not trim the artwork cache: {error}"),
     }
 }
 
@@ -1256,6 +1273,52 @@ mod tests {
     /// told "not yet" rather than handed a path to nothing: macOS loads cover
     /// art itself and dereferences a failed load without checking it, which
     /// takes the whole process with it.
+    #[test]
+    fn the_disk_cache_is_trimmed_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("spotidark-art-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        for (name, hours) in [("old", 3), ("middle", 2), ("new", 1)] {
+            let file = std::fs::File::create(dir.join(name)).unwrap();
+            file.set_len(100).unwrap();
+            file.set_modified(now - Duration::from_secs(hours * 3600))
+                .unwrap();
+        }
+        trim_disk_cache(&dir, 200);
+        assert!(!dir.join("old").exists());
+        assert!(dir.join("middle").exists());
+        assert!(dir.join("new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sparse file stands in for a full cache without filling the disk.
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_loader_trims_an_oversized_disk_cache() {
+        let dir =
+            std::env::temp_dir().join(format!("spotidark-art-startup-trim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let oversized = dir.join("oversized");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(DISK_CACHE_CAP + 1).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        drop(file);
+        std::fs::write(dir.join("recent"), b"jpeg").unwrap();
+
+        let runtime = artwork_test_runtime();
+        let _loader = artwork_test_loader(&runtime, dir.clone());
+        let started = Instant::now();
+        while oversized.exists() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!oversized.exists(), "the oldest artwork is deleted");
+        assert!(dir.join("recent").exists(), "what fits is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_cached_file_is_named_only_once_it_is_really_there() {
         let dir = std::env::temp_dir().join(format!("fastpotify-art-{}", std::process::id()));

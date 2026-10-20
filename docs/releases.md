@@ -54,8 +54,8 @@ macOS checks the bundle identifier, version, and code signature. Developer ID
 installations also require the same signing team and a passing Gatekeeper
 assessment. Move Spotidark out of the DMG into Applications before updating.
 Windows installs into the user's Programs/Spotidark folder and uses its own
-installer and registry identity, separate from Spotifast. Windows downloads
-have SHA-256 verification; they are not described as Authenticode signed.
+installer and registry identity, separate from Spotifast. The Windows installer
+is not Authenticode signed, so its integrity rests on the SHA-256 check.
 Settings, caches, and Spotify credentials survive updates.
 
 Portable, source-built, and package-manager installations do not receive the
@@ -80,7 +80,10 @@ Developer ID as Programa:
 - `APPLE_APP_SPECIFIC_PASSWORD`
 - `APPLE_TEAM_ID`
 
-Keep their values in the secret store, never the repository. Spotidark does not
+Keep their values in the secret store, never the repository. CI passes only
+these named secrets to the release workflow. Its jobs pin every action to a
+commit, install Rust from `rust-toolchain.toml` with `rustup`, and build without
+a shared cache. Spotidark does not
 need Programa's Sparkle key or CloudKit provisioning profile. Once complete
 credentials are present, signing or notarization errors stop publication; they
 never fall back to publishing an ad-hoc build.

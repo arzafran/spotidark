@@ -1,6 +1,6 @@
 ---
-title: Translating Spotifast
-description: Help translate Spotifast and preview the work so far.
+title: Translating Spotidark
+description: Help translate Spotidark and preview the work so far.
 nav_order: 6
 ---
 
@@ -10,12 +10,12 @@ There is no language setting in the regular app yet. Corrections from fluent
 speakers are welcome.
 
 Translations are stored in `.po` files, a common format supported by editors
-such as Poedit and Weblate. They are included with Spotifast, so the app does
+such as Poedit and Weblate. They are included with Spotidark, so the app does
 not contact an online translation service.
 
 ## Pilot scope
 
-Since 0.8.0, the pilot covers Home and Search navigation, Library
+The pilot covers Home and Search navigation, Library
 controls, filters, search hints, and the Liked Songs name and count. These
 languages are available for preview in demo mode, which uses sample music
 data and needs no Spotify account:
@@ -37,12 +37,11 @@ data and needs no Spotify account:
 | Chinese (Simplified) | `zh-Hans` |
 | Chinese (Traditional) | `zh-Hant` |
 
-Current `main` also translates the player bar's empty state, tooltips and
-screen-reader labels for playback, repeat, shuffle, Like, volume, device
-selection, Queue and Lyrics controls. The Queue page and panel, Recent tab,
-Lyrics panel and full-screen view, and shared loading/retry labels are also
-translated on `main`. These additions are not in 0.8.0. They keep the existing
-controls and keyboard actions. Other menus, pages and settings still need coverage.
+The player bar's empty state, tooltips and screen-reader labels for playback,
+repeat, shuffle, Like, volume, device selection, Queue and Lyrics controls are
+also translated. So are the Queue page and panel, Recent tab, Lyrics panel and
+full-screen view, and shared loading/retry labels. Translation does not change
+controls or keyboard actions. Other menus, pages and settings still need coverage.
 
 Song, album, artist and playlist names come from Spotify or their creators and
 are kept as provided, as are lyric lines and failure details. Generated queue
@@ -116,8 +115,7 @@ or `msginit`. Set its language and plural rules and translate the pilot entries.
 A maintainer must also register the locale in the app and preview it before it
 becomes available. Adding a PO alone does not add a production language option.
 
-Use the [translation problem form](https://github.com/crmne/spotifast/issues/new?template=translation.yml)
+Use the [translation problem form](https://github.com/darkroomengineering/spotidark/issues/new?template=translation.yml)
 for incorrect wording, missing translations or text that does not fit. Each
 report gets its own issue. Include the language, version, affected control, and
-the text you see; a suggested correction is welcome. The catalog headers link
-to this form too.
+the text you see; a suggested correction is welcome.

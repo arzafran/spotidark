@@ -62,23 +62,66 @@ fn the_linux_package_alias_reports_spotifast_without_copying_the_app() {
 
 #[test]
 fn existing_preferences_and_custom_connect_names_survive_the_rename() {
-    use fastpotify::settings::{Settings, ThemeChoice};
+    use fastpotify::settings::{LIKED_SONGS_KEY, Settings, ThemeChoice, VisMode};
 
     let scratch = Scratch::new();
     let path = scratch.0.join("settings.json");
     for name in ["Fastpotify", "Living room", "Carmine's laptop"] {
-        let saved = Settings {
-            device_name: name.into(),
-            theme: ThemeChoice::Light,
-            volume: 37,
-            pinned_contexts: vec![
-                "spotify:playlist:123".into(),
-                "fastpotify:liked-songs".into(),
-            ],
-            ..Settings::default()
-        };
-        saved.save(&path);
-        assert_eq!(Settings::load(&path), saved);
+        // A file as Fastpotify wrote it before the rename: its own field
+        // set, without any field added since.
+        let legacy = format!(
+            r#"{{
+  "device_name": {name},
+  "bitrate": 160,
+  "normalisation": true,
+  "theme": "light",
+  "volume": 37,
+  "sidebar_visible": false,
+  "sidebar_compact": true,
+  "search_history": ["daft punk"],
+  "pinned_contexts": ["spotify:playlist:123", "fastpotify:liked-songs"],
+  "liked_songs_pinned": true,
+  "winamp_window": true,
+  "skin": "Zaxon.wsz",
+  "vis": "scope",
+  "eq_bands_db": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+}}"#,
+            name = serde_json::to_string(name).unwrap()
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.device_name, name);
+        assert_eq!(loaded.bitrate, 160);
+        assert!(loaded.normalisation);
+        assert_eq!(loaded.theme, ThemeChoice::Light);
+        assert_eq!(loaded.volume, 37);
+        assert!(!loaded.sidebar_visible);
+        assert!(loaded.sidebar_compact);
+        assert_eq!(loaded.search_history, ["daft punk"]);
+        assert_eq!(
+            loaded.pinned_contexts,
+            ["spotify:playlist:123", "fastpotify:liked-songs"]
+        );
+        assert_eq!(
+            loaded.library_pins(),
+            ["spotify:playlist:123", LIKED_SONGS_KEY],
+            "the pre-rename Liked Songs pin still names Liked Songs"
+        );
+        assert!(loaded.winamp_window);
+        assert_eq!(loaded.skin.as_deref(), Some("Zaxon.wsz"));
+        assert_eq!(loaded.vis, VisMode::Scope);
+        assert_eq!(
+            loaded.eq_bands_db,
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        );
+        assert!(
+            !path.with_extension("json.bad").exists(),
+            "the old file is read, not set aside"
+        );
+
+        // Saving under the new name keeps every value.
+        loaded.save(&path);
+        assert_eq!(Settings::load(&path), loaded);
     }
     assert_eq!(Settings::default().device_name, "Spotidark");
 }

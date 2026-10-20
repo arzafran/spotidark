@@ -1117,6 +1117,20 @@ mod tests {
         assert!(!ctx.global_style().visuals.dark_mode);
     }
 
+    /// Where `character` alone is drawn from in the glyph atlas. A character
+    /// no installed face has is drawn as the replacement glyph, so it shares
+    /// the replacement's place in the atlas.
+    fn atlas_place(ui: &egui::Ui, font: &egui::FontId, character: char) -> [[u16; 2]; 2] {
+        let galley =
+            ui.painter()
+                .layout_no_wrap(character.to_string(), font.clone(), Color32::WHITE);
+        let uv = galley.rows[0].glyphs[0].uv_rect;
+        [uv.min, uv.max]
+    }
+
+    /// No face has these private-use characters.
+    const UNASSIGNED: [char; 2] = ['\u{10FFFD}', '\u{10FFFC}'];
+
     #[test]
     fn fonts_install_and_layout_emojis() {
         let ctx = egui::Context::default();
@@ -1128,6 +1142,19 @@ mod tests {
                 Color32::WHITE,
             );
             assert!(galley.rows[0].glyphs.len() >= 5);
+            for font in [regular(14.0), medium(14.0), semibold(14.0), bold(14.0)] {
+                let replacement = atlas_place(ui, &font, UNASSIGNED[0]);
+                assert_eq!(
+                    atlas_place(ui, &font, UNASSIGNED[1]),
+                    replacement,
+                    "a missing character is drawn as the replacement"
+                );
+                for emoji in ['🔥', '🎵', '❤', '🚀'] {
+                    let place = atlas_place(ui, &font, emoji);
+                    assert_ne!(place, replacement, "{emoji} is a box in {font:?}");
+                    assert_ne!(place[0], place[1], "{emoji} is drawn in {font:?}");
+                }
+            }
         });
         output.textures_delta.clear();
     }
@@ -1161,6 +1188,8 @@ mod tests {
 
     #[test]
     fn fonts_install_and_layout_mixed_cjk() {
+        use skrifa::MetadataProvider as _;
+
         let ctx = egui::Context::default();
         install(&ctx);
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -1171,6 +1200,20 @@ mod tests {
             );
             assert!(!galley.rows.is_empty());
             assert!(galley.rows[0].glyphs.len() >= 10);
+            // Inter has no CJK, so these come from an installed fallback. A
+            // machine without one still lays the text out, as replacements.
+            let replacement = atlas_place(ui, &regular(14.0), UNASSIGNED[0]);
+            for character in "恋におちて".chars() {
+                let installed = crate::system_fonts::fallbacks().iter().any(|font| {
+                    skrifa::FontRef::from_index(&font.bytes, font.index)
+                        .is_ok_and(|face| face.charmap().map(character).is_some())
+                });
+                assert_eq!(
+                    atlas_place(ui, &regular(14.0), character) != replacement,
+                    installed,
+                    "{character} is drawn from a fallback exactly when one has it"
+                );
+            }
         });
         output.textures_delta.clear();
     }

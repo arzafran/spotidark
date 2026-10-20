@@ -292,28 +292,32 @@ pub async fn read(path: &std::path::Path, account: &str) -> Option<Cache> {
     cache.valid_for(account).then_some(cache)
 }
 
-pub async fn write(path: &std::path::Path, cache: &Cache) -> std::io::Result<()> {
+pub async fn write(path: &std::path::Path, cache: Cache) -> std::io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || write_file(&path, &cache))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn write_file(path: &std::path::Path, cache: &Cache) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        std::fs::create_dir_all(parent)?;
     }
     let temporary = path.with_extension("json.tmp");
-    let path = path.to_owned();
-    let cache = cache.clone();
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::create(&temporary)?;
+    let file = std::fs::File::create(&temporary)?;
+    let result = (|| {
         let mut writer = BufWriter::new(file);
-        if let Err(error) = serde_json::to_writer(&mut writer, &cache)
-            .map_err(std::io::Error::other)
-            .and_then(|()| writer.flush())
-        {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
-        }
+        serde_json::to_writer(&mut writer, cache).map_err(std::io::Error::other)?;
+        writer.flush()?;
         writer.get_ref().sync_all()?;
-        crate::util::replace_file(&temporary, &path)
-    })
-    .await
-    .map_err(std::io::Error::other)?
+        // Windows requires the temporary file to be closed before replacement.
+        drop(writer);
+        crate::util::replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -520,19 +524,42 @@ mod tests {
         let path = root.join("liked.json");
         let mut songs = loaded(50, 100);
         let cache = songs.checkpoint("alice".into(), true).unwrap();
-        write(&path, &cache).await.unwrap();
+        write(&path, cache.clone()).await.unwrap();
         assert!(read(&path, "alice").await.is_some());
         assert!(read(&path, "bob").await.is_none());
         tokio::fs::create_dir(path.with_extension("json.tmp"))
             .await
             .unwrap();
-        assert!(write(&path, &cache).await.is_err());
+        assert!(write(&path, cache.clone()).await.is_err());
         assert!(
             read(&path, "alice").await.is_some(),
             "interrupted replacement preserves previous data"
         );
         tokio::fs::write(&path, b"broken JSON").await.unwrap();
         assert!(read(&path, "alice").await.is_none());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_removes_its_temporary_file() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-liked-cache-replace-{}",
+            std::process::id()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let path = root.join("liked.json");
+        // A directory in the cache file's place makes the final rename fail
+        // after the temporary file is fully written.
+        tokio::fs::create_dir_all(path.join("preserved"))
+            .await
+            .unwrap();
+        let cache = loaded(50, 100).checkpoint("alice".into(), true).unwrap();
+        assert!(write(&path, cache).await.is_err());
+        assert!(path.join("preserved").is_dir());
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the failed checkpoint does not linger"
+        );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

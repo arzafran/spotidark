@@ -103,22 +103,12 @@ application directories for the `engineering` / `darkroom` / `spotidark` identit
 
 ## Automatic updates
 
-Every push to `main` runs CI. Once its checks pass, CI builds and publishes
-`spotidark-macos.dmg` and `spotidark-windows.exe` as the rolling release, then
-removes the previous release. Each build has an increasing version for OTA.
-Apple signing is currently deferred: macOS downloads are ad-hoc signed and
-not notarized. Complete signing credentials enable Developer ID signing and
-Apple notarization automatically.
-
-Installed macOS and Windows builds check for updates and download them in the
-background by default. Choose **Restart to update** when ready; an update never
-interrupts playback automatically. Existing saved download preferences remain
-respected. Settings also provides a manual update check and an opt-out.
-
-Downloads are verified against GitHub's SHA-256 release metadata, so there is
-no separate appcast or checksum download. Move the macOS app into Applications
-before updating. Source and package-manager installations use their existing
-installation method. See [release and update details](docs/releases.md).
+Every successful CI run on `main` publishes `spotidark-macos.dmg` and
+`spotidark-windows.exe` as the new release. macOS downloads are currently
+ad-hoc signed and not notarized. Installed macOS and Windows builds download
+updates in the background and install them when you choose **Restart to
+update**. [Releases and automatic updates](docs/releases.md) describes
+publication, signing, verification and update preferences.
 
 ## Personal Spotify app
 
@@ -141,9 +131,11 @@ Demo mode uses sample data without signing into Spotify. See
 Keep upstream changes reviewable, preserve contributor history, and retain
 copyright notices when integrating updates.
 
-The detailed documentation and legacy packaging recipes remain as upstream
-reference material. Their Spotifast download links, migration instructions,
-and release history do not describe Spotidark distributions.
+The guides and reference pages in [`docs/`](docs/) describe Spotidark, with
+file locations, settings and the command line in
+[Settings & Files](docs/_reference/settings-and-files.md). The legacy
+packaging recipes (`PACKAGING.md`, `packaging/`) remain upstream reference
+material and do not publish Spotidark.
 
 ## Credits and license
 

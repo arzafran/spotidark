@@ -368,22 +368,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Presses the shortcut a label names, such as `Cmd+Shift+M`, and
+    /// returns the actions the key handler produced.
+    fn press_label(app: &mut App, ctx: &egui::Context, label: &str) -> String {
+        let mut parts: Vec<&str> = label.split('+').collect();
+        let key = Key::from_name(parts.pop().unwrap()).unwrap_or_else(|| panic!("key in {label}"));
+        let mut modifiers = Modifiers::NONE;
+        for part in parts {
+            modifiers |= match part {
+                // The modifiers as the platform reports its command key.
+                "Cmd" if cfg!(target_os = "macos") => Modifiers::MAC_CMD | Modifiers::COMMAND,
+                "Ctrl" if !cfg!(target_os = "macos") => Modifiers::CTRL | Modifiers::COMMAND,
+                "Shift" => Modifiers::SHIFT,
+                other => panic!("{other} is not this platform's modifier in {label}"),
+            };
+        }
+        app.actions.clear();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| handle(app, ui.ctx()));
+        output.textures_delta.clear();
+        format!("{:?}", app.actions)
+    }
+
+    fn shortcut_test_app(name: &str) -> (App, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "spotidark-{name}-shortcut-test-{}",
+            std::process::id()
+        ));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let app = App::new(
+            &crate::backend::Waker::default(),
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+            },
+        );
+        (app, root)
+    }
+
+    /// Each label shown for a shortcut is the key that performs it.
     #[test]
     fn shortcut_constants_name_the_platform_modifier() {
-        let expected = if cfg!(target_os = "macos") {
-            ["Cmd+B", "Cmd+Q", "Cmd+Shift+M", "Cmd+Shift+K"]
-        } else {
-            ["Ctrl+B", "Ctrl+Q", "Ctrl+M", "Ctrl+Shift+K"]
+        let (mut app, root) = shortcut_test_app("constants");
+        let ctx = egui::Context::default();
+        for (label, action) in [
+            (SIDEBAR_SHORTCUT, Action::ToggleSidebar),
+            (QUIT_SHORTCUT, Action::Quit),
+            (WINAMP_SHORTCUT, Action::ToggleWinampWindow),
+            (MILKDROP_SHORTCUT, Action::ToggleWinampMilkdrop),
+        ] {
+            assert_eq!(
+                press_label(&mut app, &ctx, label),
+                format!("{:?}", [action]),
+                "{label}"
+            );
+        }
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The dialog names the key that works where the platform reserves the
+    /// usual one: Cmd+H hides and Cmd+M minimises on macOS.
+    #[test]
+    fn shortcut_dialog_names_platform_reserved_alternatives() {
+        let label = |description| {
+            SHORTCUTS
+                .iter()
+                .find(|(_, candidate)| *candidate == description)
+                .map(|(keys, _)| *keys)
+                .unwrap()
         };
-        assert_eq!(
-            [
-                SIDEBAR_SHORTCUT,
-                QUIT_SHORTCUT,
-                WINAMP_SHORTCUT,
-                MILKDROP_SHORTCUT,
-            ],
-            expected
-        );
+        let (mut app, root) = shortcut_test_app("reserved");
+        let ctx = egui::Context::default();
+        for (description, action) in [
+            ("Home", Action::Open(Page::Home)),
+            ("Winamp mini player", Action::ToggleWinampWindow),
+        ] {
+            let keys = label(description);
+            assert_eq!(
+                press_label(&mut app, &ctx, keys),
+                format!("{:?}", [action]),
+                "{description}: {keys}"
+            );
+            if cfg!(target_os = "macos") {
+                assert!(keys.contains("Shift"), "{keys} avoids the reserved key");
+            }
+        }
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -395,24 +483,6 @@ mod tests {
         };
         for (keys, _) in SHORTCUTS {
             assert!(!keys.contains(other), "wrong modifier in {keys}");
-        }
-    }
-
-    #[test]
-    fn shortcut_dialog_names_platform_reserved_alternatives() {
-        let label = |description| {
-            SHORTCUTS
-                .iter()
-                .find(|(_, candidate)| *candidate == description)
-                .map(|(keys, _)| *keys)
-                .unwrap()
-        };
-        if cfg!(target_os = "macos") {
-            assert_eq!(label("Home"), "Cmd+Shift+H");
-            assert_eq!(label("Winamp mini player"), "Cmd+Shift+M");
-        } else {
-            assert_eq!(label("Home"), "Ctrl+H");
-            assert_eq!(label("Winamp mini player"), "Ctrl+M");
         }
     }
 

@@ -1,9 +1,7 @@
-title: Spotifast
-fastpotify_version: "0.8.0"
-description: A fast, lightweight Spotify app for Linux, macOS, and Windows.
+title: Spotidark
+description: A native Spotify client for macOS, Windows, and Linux by Darkroom Engineering, based on Spotifast.
 lang: en-US
 timezone: Europe/Berlin
-url: https://spotifast.rocks
 baseurl: ""
 logo: /assets/images/logo.svg
 image: /screenshot.png
@@ -50,29 +48,29 @@ jekyll_vitepress:
     page_type: TechArticle
     image:
       path: /screenshot.png
-      alt: Spotifast showing a playlist with the queue open and a track playing
+      alt: The app showing a playlist with the queue open and a track playing
     publisher:
-      type: Person
-      name: Carmine Paolino
-      url: https://paolino.me
+      type: Organization
+      name: Darkroom Engineering
+      url: https://github.com/darkroomengineering
       same_as:
-        - https://github.com/crmne/spotifast
+        - https://github.com/darkroomengineering/spotidark
   llms:
-    title: Spotifast
+    title: Spotidark
     description: >-
-      Documentation for a native Spotify client for Linux, macOS,
-      and Windows. It covers local playback, library access, and Spotify
+      Documentation for Spotidark, a native Spotify client for macOS, Windows,
+      and Linux. It covers local playback, library access, and Spotify
       Connect.
     full: true
     details: >-
       Covers installation, sign-in, everyday use, settings, and Spotify
       connections. Source is on
-      [GitHub](https://github.com/crmne/spotifast).
+      [GitHub](https://github.com/darkroomengineering/spotidark).
   branding:
-    site_title: Spotifast
+    site_title: Spotidark
     logo:
       default: /assets/images/logo.svg
-      alt: Spotifast
+      alt: Spotidark
   syntax:
     light_theme: github
     dark_theme: github.dark
@@ -80,9 +78,10 @@ jekyll_vitepress:
     enabled: true
     show_on_docs: false
     message: >-
-      Brought to you by <a href="https://paolino.me" target="_blank" rel="noreferrer">Carmine Paolino</a>, maker of
+      Spotidark is maintained by <a href="https://github.com/darkroomengineering" target="_blank" rel="noreferrer">Darkroom Engineering</a>.
+      It is a fork of <a href="https://github.com/crmne/spotifast" target="_blank" rel="noreferrer">Spotifast</a> by Carmine Paolino and contributors (MIT).
     copyright: >-
-      <span class="footer-brand-links"><a href="https://chatwithwork.com" class="footer-chatwithwork-link" target="_blank" rel="noreferrer"><img class="footer-chatwithwork-logo theme-image light" src="https://chatwithwork.com/logotype.svg" alt="Chat with Work"><img class="footer-chatwithwork-logo theme-image dark" src="https://chatwithwork.com/logotype-dark.svg" alt="Chat with Work"></a><a href="https://rubyllm.com" class="footer-rubyllm-link" target="_blank" rel="noreferrer"><img class="footer-rubyllm-logo theme-image light" src="https://rubyllm.com/assets/images/logotype.svg" alt="RubyLLM"><img class="footer-rubyllm-logo theme-image dark" src="https://rubyllm.com/assets/images/logotype_dark.svg" alt="RubyLLM"></a><a href="https://paolino.me/projects" target="_blank" rel="noreferrer" aria-label="More projects by Carmine Paolino">and more</a></span><br><span class="footer-built-with">Docs built with <a href="https://jekyll-vitepress.dev" target="_blank" rel="noreferrer">Jekyll VitePress</a>. Spotifast is an independent project, not affiliated with or endorsed by Spotify AB. Spotify is a trademark of Spotify AB.</span>
+      Docs built with <a href="https://jekyll-vitepress.dev" target="_blank" rel="noreferrer">Jekyll VitePress</a>. Spotidark is an independent fork, not affiliated with or endorsed by Spotify AB or the Spotifast team. Spotify is a trademark of Spotify AB.
   doc_footer:
     enabled: true
     previous_label: Previous page
@@ -93,17 +92,13 @@ jekyll_vitepress:
     format: "%Y-%m-%d %H:%M"
   edit_link:
     enabled: true
-    pattern: "https://github.com/crmne/spotifast/edit/main/docs/:path"
+    pattern: "https://github.com/darkroomengineering/spotidark/edit/main/docs/:path"
     text: Edit this page on GitHub
   github_star:
     enabled: true
-    repository: crmne/spotifast
+    repository: darkroomengineering/spotidark
     text: Star
     show_count: true
-  github_sponsor:
-    enabled: true
-    user: crmne
-    text: Sponsor
 
 plugins:
   - jekyll-redirect-from

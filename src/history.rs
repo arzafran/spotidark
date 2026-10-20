@@ -37,12 +37,27 @@ pub struct History {
 }
 
 impl History {
-    /// Reads the history, or returns an empty history if the file is unreadable.
+    /// Reads the history, or returns an empty history if there is none.
+    ///
+    /// A file that cannot be parsed is kept beside it as `history.json.bad`
+    /// before starting empty, so the next save does not destroy it.
     pub fn load(path: &Path) -> Self {
-        let plays = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Vec<PlayHistory>>(&text).ok())
-            .unwrap_or_default();
+        let plays = match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str::<Vec<PlayHistory>>(&text).unwrap_or_else(|error| {
+                log::warn!("the play history is unreadable: {error}");
+                let kept = path.with_extension("json.bad");
+                if let Err(error) = crate::util::replace_file(path, &kept) {
+                    log::warn!("could not keep the unreadable play history: {error}");
+                }
+                Vec::new()
+            }),
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("could not read the play history: {error}");
+                }
+                Vec::new()
+            }
+        };
         Self {
             plays,
             dirty: false,
@@ -57,21 +72,26 @@ impl History {
         self.plays.is_empty()
     }
 
-    /// Writes the history if it changed since the last save.
+    /// Writes the history if it changed since the last save. A failed write
+    /// leaves it marked as changed, so the next save tries again.
     pub fn save(&mut self, path: &Path) {
         if !self.dirty {
             return;
         }
-        self.dirty = false;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match serde_json::to_string(&self.plays) {
-            Ok(text) => {
-                if let Err(error) = std::fs::write(path, text) {
-                    log::warn!("could not write the play history: {error}");
-                }
-            }
+        let written = serde_json::to_string(&self.plays)
+            .map_err(std::io::Error::other)
+            .and_then(|text| {
+                crate::util::write_replacing(
+                    &path.with_extension("json.tmp"),
+                    path,
+                    text.as_bytes(),
+                )
+            });
+        match written {
+            Ok(()) => self.dirty = false,
             Err(error) => log::warn!("could not write the play history: {error}"),
         }
     }
@@ -204,22 +224,6 @@ mod tests {
         assert!(counts_after(0) >= std::time::Duration::from_secs(1));
     }
 
-    /// A counted play is not added again on later frames.
-    #[test]
-    fn counting_never_overflows_however_long_a_song_runs() {
-        let threshold = counts_after(240_000);
-        let mut listened = std::time::Duration::ZERO;
-        let mut recorded = 0;
-        // Continue for an hour after crossing the threshold.
-        for _ in 0..3_600 {
-            listened += std::time::Duration::from_secs(1);
-            if recorded == 0 && listened >= threshold {
-                recorded += 1;
-            }
-        }
-        assert_eq!(recorded, 1, "written down once, and it did not panic");
-    }
-
     /// Both sources are sorted together, newest first.
     #[test]
     fn the_two_histories_interleave_by_time() {
@@ -312,5 +316,97 @@ mod tests {
             format!("spotify:track:{}", KEPT + 9),
             "the newest is first"
         );
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("spotidark-history-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn one_play() -> History {
+        let mut history = History::default();
+        history.record(
+            Track {
+                uri: "spotify:track:kept".into(),
+                ..Track::default()
+            },
+            "2026-09-01T09:00:00Z".parse().unwrap(),
+        );
+        history
+    }
+
+    #[test]
+    fn a_saved_history_loads_back_and_leaves_no_temporary() {
+        let dir = scratch("round-trip");
+        let path = dir.join("history.json");
+        std::fs::write(path.with_extension("json.tmp"), "stale").unwrap();
+        one_play().save(&path);
+        assert!(!path.with_extension("json.tmp").exists());
+        let loaded = History::load(&path);
+        assert_eq!(loaded.plays().len(), 1);
+        assert_eq!(loaded.plays()[0].track.uri, "spotify:track:kept");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unreadable_history_is_kept_aside_and_never_overwritten() {
+        let dir = scratch("corrupt");
+        let path = dir.join("history.json");
+        std::fs::write(&path, "[{\"track\": truncated").unwrap();
+        let mut history = History::load(&path);
+        assert!(history.is_empty());
+        let bad = path.with_extension("json.bad");
+        assert_eq!(
+            std::fs::read_to_string(&bad).unwrap(),
+            "[{\"track\": truncated"
+        );
+        history.record(
+            Track {
+                uri: "spotify:track:new".into(),
+                ..Track::default()
+            },
+            "2026-09-01T09:00:00Z".parse().unwrap(),
+        );
+        history.save(&path);
+        assert_eq!(History::load(&path).plays().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&bad).unwrap(),
+            "[{\"track\": truncated",
+            "saving does not touch the kept copy"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_history_starts_empty_without_a_bad_copy() {
+        let dir = scratch("missing");
+        let path = dir.join("history.json");
+        assert!(History::load(&path).is_empty());
+        assert!(!path.with_extension("json.bad").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_save_is_retried_by_the_next_one() {
+        let dir = scratch("retry");
+        // A file where the history's folder should be makes the write fail.
+        let blocker = dir.join("state");
+        std::fs::write(&blocker, "not a folder").unwrap();
+        let path = blocker.join("history.json");
+        let mut history = one_play();
+        history.save(&path);
+        assert!(!path.exists());
+
+        std::fs::remove_file(&blocker).unwrap();
+        history.save(&path);
+        assert_eq!(
+            History::load(&path).plays().len(),
+            1,
+            "still marked changed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

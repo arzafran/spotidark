@@ -69,7 +69,15 @@ const LISTED_FRESH: Duration = Duration::from_secs(30);
 /// of folders.
 const MAX_DEPTH: usize = 4;
 
-/// A preset pack projectM curates, fetched as a zip of `.milk` files.
+/// The most entries a preset pack may hold. Cream of the Crop has about
+/// 10,000.
+const MAX_PACK_ENTRIES: usize = 20_000;
+/// The most bytes of presets one pack may write. Cream of the Crop's come
+/// to about 117 MB.
+const MAX_PACK_BYTES: usize = 512 << 20;
+
+/// A preset pack projectM curates, fetched as a zip of `.milk` files from
+/// a fixed commit.
 pub struct Pack {
     pub name: &'static str,
     pub url: &'static str,
@@ -80,12 +88,12 @@ pub struct Pack {
 pub const PACKS: [Pack; 2] = [
     Pack {
         name: "MilkDrop's own",
-        url: "https://github.com/projectM-visualizer/presets-milkdrop-original/archive/refs/heads/master.zip",
+        url: "https://github.com/projectM-visualizer/presets-milkdrop-original/archive/e03b83e3338d8f1ed6cbcf908c719f249ef24288.zip",
         note: "The 550 presets that shipped with MilkDrop 2; about 1 MB.",
     },
     Pack {
         name: "Cream of the Crop",
-        url: "https://github.com/projectM-visualizer/presets-cream-of-the-crop/archive/refs/heads/master.zip",
+        url: "https://github.com/projectM-visualizer/presets-cream-of-the-crop/archive/0180df21f5e0bd39b9060cc5de420ed2f1f9e509.zip",
         note: "Jason Fletcher's pick of 9,800 presets the community made; about 25 MB.",
     },
 ];
@@ -368,9 +376,24 @@ pub fn fetch_pack(
 
 /// Writes the `.milk` files of a zip into the folder.
 pub fn unpack_presets(zip: &[u8], folder: &Path) -> Result<usize, String> {
+    unpack_presets_within(zip, folder, MAX_PACK_ENTRIES, MAX_PACK_BYTES)
+}
+
+fn unpack_presets_within(
+    zip: &[u8],
+    folder: &Path,
+    max_entries: usize,
+    max_bytes: usize,
+) -> Result<usize, String> {
     let archive = crate::skin::zip::Archive::parse(zip).map_err(|error| error.to_string())?;
+    if archive.entries().len() > max_entries {
+        return Err(format!(
+            "the preset pack has more than {max_entries} entries"
+        ));
+    }
     std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
     let mut written = 0;
+    let mut written_bytes = 0usize;
     for entry in archive.entries() {
         if entry.is_dir() {
             continue;
@@ -380,6 +403,13 @@ pub fn unpack_presets(zip: &[u8], folder: &Path) -> Result<usize, String> {
             continue;
         }
         let bytes = archive.read(entry).map_err(|error| error.to_string())?;
+        written_bytes = written_bytes.saturating_add(bytes.len());
+        if written_bytes > max_bytes {
+            return Err(format!(
+                "the preset pack holds more than {} MB of presets",
+                max_bytes >> 20
+            ));
+        }
         std::fs::write(folder.join(file_name), bytes).map_err(|error| error.to_string())?;
         written += 1;
     }
@@ -511,6 +541,26 @@ mod tests {
         presets.next(false);
         assert_eq!(presets.current(), None);
         assert_eq!(presets.take_request(), None);
+    }
+
+    #[test]
+    fn a_pack_beyond_the_entry_or_size_cap_is_refused() {
+        let dir = temp_dir("milkdrop-caps");
+        let names: Vec<String> = (0..4).map(|n| format!("pack/{n}.milk")).collect();
+        let entries: Vec<(&str, &[u8], bool)> = names
+            .iter()
+            .map(|name| (name.as_str(), b"[preset00]".as_slice(), false))
+            .collect();
+        let zip = crate::skin::zip::write(&entries);
+        assert!(unpack_presets_within(&zip, &dir, 3, usize::MAX).is_err());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "nothing is written from a pack with too many entries"
+        );
+        assert!(unpack_presets_within(&zip, &dir, 4, 3 * 10).is_err());
+        assert_eq!(unpack_presets_within(&zip, &dir, 4, 4 * 10), Ok(4));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
