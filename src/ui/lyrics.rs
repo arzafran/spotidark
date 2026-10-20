@@ -348,7 +348,7 @@ fn fullscreen_header(app: &mut App, ui: &mut egui::Ui) {
             {
                 app.actions.push(Action::SetLyricsFullscreen(false));
             }
-            let hint = if app.lyrics_reduce_motion {
+            let hint = if app.motion_reduced {
                 gettext(app.locale, "Enable lyrics motion")
             } else {
                 gettext(app.locale, "Reduce lyrics motion")
@@ -357,7 +357,7 @@ fn fullscreen_header(app: &mut App, ui: &mut egui::Ui) {
                 ui,
                 Icon::AudioLines,
                 18.0,
-                if app.lyrics_reduce_motion {
+                if app.motion_reduced {
                     palette.secondary
                 } else {
                     palette.text
@@ -494,7 +494,7 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
     let following = app.lyrics_following && !manual_scroll;
     let follow = following && app.lyrics_line_shown != Some(active);
     let animation =
-        egui::style::ScrollAnimation::duration(if app.lyrics_reduce_motion { 0.0 } else { 0.45 });
+        egui::style::ScrollAnimation::duration(if app.motion_reduced { 0.0 } else { 0.45 });
     let size = (ui.available_width() * 0.046).clamp(28.0, 42.0);
     // The line being sung brightens; all lines keep the same font metrics
     // so highlighting cannot rewrap the words during a transition.
@@ -526,7 +526,7 @@ fn fullscreen_contents(app: &mut App, ui: &mut egui::Ui) {
                 let lit = ui.ctx().animate_bool_with_time(
                     egui::Id::new("lyric-line").with(("fullscreen", &now.uri, index)),
                     is_active,
-                    if app.lyrics_reduce_motion { 0.0 } else { 0.3 },
+                    if app.motion_reduced { 0.0 } else { 0.3 },
                 );
                 let color = if lyrics.synced {
                     blend(quiet, palette.text, lit)

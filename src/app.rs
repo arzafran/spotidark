@@ -329,7 +329,7 @@ pub struct App {
     pub lyrics_fullscreen_seen: bool,
     lyrics_fullscreen_restoring: Option<bool>,
     lyrics_restore_maximized: bool,
-    pub lyrics_reduce_motion: bool,
+    pub motion_reduced: bool,
     pub lyrics_backdrop: crate::images::LyricsBackdrop,
     /// The track the lyrics below are for.
     pub lyrics_uri: Option<String>,
@@ -680,7 +680,7 @@ impl App {
             lyrics_fullscreen_seen: false,
             lyrics_fullscreen_restoring: None,
             lyrics_restore_maximized: false,
-            lyrics_reduce_motion: false,
+            motion_reduced: false,
             lyrics_backdrop: Default::default(),
             lyrics_uri: None,
             lyrics: Loadable::NotLoaded,
@@ -7746,12 +7746,12 @@ impl App {
             Action::PauseLyricsFollow => self.lyrics_following = false,
             Action::RetryLyrics => self.request_lyrics(),
             Action::ToggleLyricsMotion => {
-                self.settings.motion = if self.lyrics_reduce_motion {
+                self.settings.motion = if self.motion_reduced {
                     crate::settings::MotionPreference::Full
                 } else {
                     crate::settings::MotionPreference::Reduced
                 };
-                self.lyrics_reduce_motion = !self.lyrics_reduce_motion;
+                self.motion_reduced = !self.motion_reduced;
                 self.settings_dirty = true;
             }
             Action::ToggleDevicesPopup => {

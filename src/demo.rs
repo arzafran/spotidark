@@ -1413,7 +1413,7 @@ mod tests {
             );
             assert!(app.lyrics_fullscreen.is_some());
             for source in ["Reduce lyrics motion", "Enable lyrics motion"] {
-                let before = app.lyrics_reduce_motion;
+                let before = app.motion_reduced;
                 let tree = accessible_frame(&ctx, &mut app, vec![]);
                 let motion = accessible_node(&tree, &gettext(locale, source), Role::Button);
                 accessible_frame(
@@ -1421,7 +1421,7 @@ mod tests {
                     &mut app,
                     vec![accessible_action(motion, AccessibleAction::Click, None)],
                 );
-                assert_ne!(app.lyrics_reduce_motion, before);
+                assert_ne!(app.motion_reduced, before);
             }
             app.lyrics_following = false;
             let tree = accessible_frame(&ctx, &mut app, vec![]);
