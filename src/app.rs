@@ -421,12 +421,12 @@ pub struct App {
     /// Time of the last scroll event, used to detect the end of a gesture.
     scroll_last_event: Option<Instant>,
     autoscroll: crate::autoscroll::Autoscroll,
-    /// How each table is sorted, per page, for as long as the app runs.
     /// The rows picked out in a track table, and the page they belong to.
     /// One table at a time: picking rows on another page replaces it.
     /// The page it belongs to, what that page's list looked like when the
     /// rows were picked, and the rows.
     pub selection: Option<(Page, String, RowSelection)>,
+    /// How each table is sorted, per page, for as long as the app runs.
     pub table_sorts: HashMap<Page, TableSort>,
     /// User ids resolved to display names; `None` while unknown, so an id
     /// is asked about only once per run.
@@ -489,17 +489,17 @@ const SCROLL_GESTURE_GAP: Duration = Duration::from_millis(150);
 /// How far short Linux trackpad deltas land of what other players scroll.
 const TRACKPAD_SCALE: f32 = 1.8;
 
-/// The glide's exponential decay time, in seconds; the speed below which a
-/// lift starts no glide; and the speed at which a glide stops, points per
-/// second.
 /// How many plays the Home shelf asks for: it shows sixteen cards.
 const HOME_RECENTS: u32 = 50;
 /// How many plays the Recents tab asks for at a time. Spotify's own
 /// endpoint limit is fifty. A shorter page marks the end.
 const RECENTS_PAGE: u32 = 50;
 
+/// The glide's exponential decay time, in seconds.
 const GLIDE_DECAY: f32 = 0.35;
+/// The speed below which a lift starts no glide, points per second.
 const GLIDE_START: f32 = 120.0;
+/// The speed at which a glide stops, points per second.
 const GLIDE_STOP: f32 = 40.0;
 
 impl App {
@@ -2713,6 +2713,21 @@ impl App {
         }
     }
 
+    /// Whether playback will be running once the actions already queued
+    /// this frame apply, so a `play` or `pause` behind another command in
+    /// the same batch answers the state the user asked for, not the one
+    /// before it.
+    fn playing_once_queued_actions_apply(&self) -> bool {
+        self.actions.iter().fold(
+            self.now_playing().is_some_and(|now| now.playing),
+            |playing, action| match action {
+                Action::TogglePlay => !playing,
+                Action::PlayContext { .. } => true,
+                _ => playing,
+            },
+        )
+    }
+
     fn handle_control_commands(&mut self) {
         let Some(queue) = &self.control_commands else {
             return;
@@ -2720,7 +2735,7 @@ impl App {
         let commands: Vec<ControlCommand> =
             std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
         for command in commands {
-            let playing = self.now_playing().is_some_and(|now| now.playing);
+            let playing = self.playing_once_queued_actions_apply();
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
                 ControlCommand::ReloadThemes => Some(Action::ReloadThemes),
@@ -2767,7 +2782,7 @@ impl App {
             return;
         };
         for command in commands {
-            let playing = self.now_playing().is_some_and(|now| now.playing);
+            let playing = self.playing_once_queued_actions_apply();
             let action = match command {
                 MediaCommand::Play => (!playing).then_some(Action::TogglePlay),
                 MediaCommand::Pause | MediaCommand::Stop => playing.then_some(Action::TogglePlay),
@@ -3604,6 +3619,14 @@ impl App {
             self.play_request(PlayRequest::tracks(uris).starting_at_index(index), false);
             return;
         }
+        let target = self.target();
+        if matches!(target, Target::Remote(None)) && self.remote_fresh().is_none() {
+            // With nothing to act on, the queue stays as shown and one call
+            // earns the "pick something first" toast; a skip per row would
+            // repeat it.
+            self.remote(RemoteAction::Next, None);
+            return;
+        }
         let mut skips = index + 1;
         let mut consumed: Vec<String> = Vec::new();
         if let Loadable::Loaded(queue) = &mut self.queue {
@@ -3635,19 +3658,13 @@ impl App {
         self.expect_track(uri.clone(), 0);
         self.set_play_pending(vec![uri]);
         self.optimistic_playing = Some((true, Instant::now()));
-        match self.target() {
+        match target {
             Target::Local => {
                 for _ in 0..skips {
                     self.backend.player(PlayerCommand::Next);
                 }
             }
             Target::Remote(device_id) => {
-                // With nothing to act on, one call earns the "pick
-                // something first" toast; a skip per row would repeat it.
-                if device_id.is_none() && self.remote_fresh().is_none() {
-                    self.remote(RemoteAction::Next, None);
-                    return;
-                }
                 for _ in 0..skips {
                     self.remote(RemoteAction::Next, device_id.clone());
                 }
@@ -9659,10 +9676,9 @@ mod tests {
     }
 
     /// A song the Web API had greyed out stays greyed out when the session
-    /// reads the rows, at every place it recurs, whether the Web API's word
-    /// came from an earlier page or from the disk cache of a visit the
-    /// playlist has changed since. Rows it never described stay unknown,
-    /// and a song it later calls playable is no longer greyed out.
+    /// reads the rows, at every place it recurs, when the Web API's word
+    /// came from an earlier page. Rows it never described stay unknown, and
+    /// a song it later calls playable is no longer greyed out.
     #[test]
     fn a_session_read_keeps_a_songs_known_unavailability() {
         let mut app = headless_app();
@@ -9724,52 +9740,10 @@ mod tests {
         ));
         assert_eq!(rows(&app, "pl1"), [Some(false), None, None, Some(false)]);
 
-        // The Web API's word from the disk cache of another visit, read
-        // after the session page arrived and never adopted, the playlist
-        // having changed since.
-        app.playlist_pages.insert(
-            "pl2".into(),
-            PlaylistPage {
-                playlist: Loadable::Loaded(Playlist {
-                    id: "pl2".into(),
-                    snapshot_id: Some("now".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
-        app.handle_api(items(
-            "pl2",
-            vec![
-                row("spotify:track:other", None),
-                row("spotify:track:fine", None),
-            ],
-        ));
-        app.receive_playlist_cache(
-            "alice",
-            "pl2",
-            0,
-            Some(PlaylistCache {
-                snapshot: "then".into(),
-                items: vec![row("spotify:track:other", Some(false))],
-                total: 1,
-                next_offset: None,
-            }),
-        );
-        assert_eq!(
-            rows(&app, "pl2"),
-            [Some(false), None],
-            "the cache's word reaches the rows already shown"
-        );
-        assert!(
-            app.playlist_pages["pl2"].pending_cache.is_none(),
-            "though the stale cache itself is not adopted"
-        );
-
         // A song the Web API later calls playable is no longer greyed out.
-        app.handle_api(items("pl2", vec![row("spotify:track:other", Some(true))]));
-        app.handle_api(items("pl2", vec![row("spotify:track:other", None)]));
-        assert_eq!(rows(&app, "pl2"), [None]);
+        app.handle_api(items("pl1", vec![row("spotify:track:gone", Some(true))]));
+        app.handle_api(items("pl1", vec![row("spotify:track:gone", None)]));
+        assert_eq!(rows(&app, "pl1"), [None]);
     }
 
     fn availability_row(playable: Option<bool>) -> PlaylistItem {
@@ -9878,6 +9852,10 @@ mod tests {
         assert_eq!(shown_availability(&mut app, "pl1"), None);
         app.receive_playlist_cache("alice", "pl1", 0, old_availability_cache(false));
         assert_eq!(shown_availability(&mut app, "pl1"), Some(false));
+        assert!(
+            app.playlist_pages["pl1"].pending_cache.is_none(),
+            "though the stale cache itself is not adopted"
+        );
     }
 
     #[test]
@@ -10986,6 +10964,40 @@ mod tests {
         assert!(
             next.is_empty(),
             "the row above the chosen song went with it"
+        );
+    }
+
+    /// With no device to play on, a chosen queue row changes nothing: the
+    /// rows, the hand-queued songs, and the playing song stay as shown.
+    #[test]
+    fn a_chosen_queue_row_without_a_device_leaves_the_queue_alone() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.local_ready = false;
+        app.manual_queue = vec!["spotify:track:b".into()];
+        app.queue = loaded_queue("spotify:track:a", &["spotify:track:b", "spotify:track:c"]);
+        assert!(matches!(app.target(), Target::Remote(None)));
+        app.apply(
+            Action::PlayFromRow {
+                context: RowContext::Queue,
+                uri: "spotify:track:c".into(),
+                index: 1,
+            },
+            &ctx,
+        );
+        let (current, next) = queue_uris(&app);
+        assert_eq!(current.as_deref(), Some("spotify:track:a"));
+        assert_eq!(next, vec!["spotify:track:b", "spotify:track:c"]);
+        assert_eq!(app.manual_queue, vec!["spotify:track:b".to_string()]);
+        assert!(!app.play_pending("spotify:track:c"));
+        assert_ne!(
+            app.current_track_uri().as_deref(),
+            Some("spotify:track:c"),
+            "the chosen row is not marked as playing"
+        );
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.message.as_str()),
+            Some("Nothing is playing. Pick something first")
         );
     }
 
@@ -13832,8 +13844,13 @@ mod tests {
     }
 
     fn headless_app() -> App {
-        let root =
-            std::env::temp_dir().join(format!("fastpotify-volume-test-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-headless-test-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
         let dirs = AppDirs {
             config: root.join("config"),
             state: root.join("state"),
@@ -17523,6 +17540,44 @@ mod tests {
             app.actions
         );
         assert!(queue.lock().expect("the queue").is_empty());
+    }
+
+    /// A `play` or `pause` behind another command in the same batch reads
+    /// the state the earlier command asked for, not the one before it.
+    #[test]
+    fn a_batched_play_or_pause_follows_the_commands_before_it() {
+        for (batch, expected) in [
+            (
+                vec![ControlCommand::PlayPause, ControlCommand::Pause],
+                2usize,
+            ),
+            (vec![ControlCommand::Play, ControlCommand::Play], 1),
+            (vec![ControlCommand::Play, ControlCommand::Pause], 2),
+            (
+                vec![
+                    ControlCommand::PlayUri("spotify:playlist:pl1".to_owned()),
+                    ControlCommand::Play,
+                ],
+                0,
+            ),
+        ] {
+            // #given
+            let mut app = headless_app();
+            let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+            app.control_commands = Some(std::sync::Arc::clone(&queue));
+
+            // #when
+            queue.lock().expect("the queue").extend(batch.clone());
+            app.handle_control_commands();
+
+            // #then
+            let toggles = app
+                .actions
+                .iter()
+                .filter(|action| matches!(action, Action::TogglePlay))
+                .count();
+            assert_eq!(toggles, expected, "{batch:?} gave {:?}", app.actions);
+        }
     }
 
     /// New snapshot fields are appended so older clients keep working.

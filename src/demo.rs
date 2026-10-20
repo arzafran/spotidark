@@ -4168,14 +4168,20 @@ mod tests {
             data.insert_temp(egui::Id::new("settings-filter"), "Frame rate".to_string());
         });
 
-        // Read labels from the real Settings page.
-        let drawn = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
+        ctx.enable_accesskit();
+
+        // Read labels and the screen-reader tree from the real Settings page.
+        let drawn = |app: &mut App,
+                     ctx: &egui::Context,
+                     events: Vec<egui::Event>|
+         -> (Vec<String>, egui::accesskit::TreeUpdate) {
             let input = egui::RawInput {
                 // Draw the full Settings page, including MilkDrop.
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(1280.0, 4000.0),
                 )),
+                events,
                 ..Default::default()
             };
             let mut output = ctx.run_ui(input, |ui| app.frame_ui(ui));
@@ -4193,25 +4199,50 @@ mod tests {
             for clipped in &output.shapes {
                 walk(&clipped.shape, &mut said);
             }
-            said
+            let tree = output
+                .platform_output
+                .accesskit_update
+                .expect("screen-reader tree");
+            (said, tree)
         };
 
         for _ in 0..3 {
-            let said = drawn(&mut app, &ctx);
+            let (said, _) = drawn(&mut app, &ctx, vec![]);
             assert!(
                 said.iter().any(|text| text.contains("60 fps")),
                 "the dial names the rate it is on: {said:?}"
             );
         }
 
-        // Every stop can be reached, and each names itself.
-        for (rate, expected) in [
-            (144, "144 fps, your screen"),
-            (0, "Uncapped"),
-            (30, "30 fps"),
+        // The dial is the slider whose notches are the stops.
+        let notches = (crate::milkdrop::fps_stops(144, 60).len() - 1) as f64;
+        let (_, tree) = drawn(&mut app, &ctx, vec![]);
+        let dial = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == egui::accesskit::Role::Slider
+                    && node.max_numeric_value() == Some(notches)
+                    && node.numeric_value_step() == Some(1.0)
+            })
+            .expect("the frame-rate dial")
+            .0;
+
+        // Every stop can be reached one notch at a time, and each names itself.
+        use egui::accesskit::Action::{Decrement, Increment};
+        for (notch, rate, expected) in [
+            (Increment, 144, "144 fps, your screen"),
+            (Increment, 0, "Uncapped"),
+            (Decrement, 144, "144 fps, your screen"),
+            (Decrement, 60, "60 fps"),
+            (Decrement, 30, "30 fps"),
         ] {
-            app.settings.milkdrop_fps = rate;
-            let said = drawn(&mut app, &ctx);
+            drawn(&mut app, &ctx, vec![accessible_action(dial, notch, None)]);
+            assert_eq!(
+                app.settings.milkdrop_fps, rate,
+                "one {notch:?} of the dial lands on the next stop"
+            );
+            let (said, _) = drawn(&mut app, &ctx, vec![]);
             assert!(
                 said.iter().any(|text| text == expected),
                 "the dial on {rate} should read {expected}: {said:?}"
