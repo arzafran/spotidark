@@ -828,6 +828,8 @@ impl Backend {
             })
         };
         let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
+        let lyrics_cache = dirs.lyrics_cache_dir();
+        runtime.spawn_blocking(move || crate::lyrics::trim_cache(&lyrics_cache));
         let activity = Arc::new(NetActivity::default());
 
         let worker_activity = Arc::clone(&activity);
