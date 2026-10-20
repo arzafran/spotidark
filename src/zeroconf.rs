@@ -194,6 +194,16 @@ fn get_info_with_timeout(
     response.json().context("receiver sent an unreadable reply")
 }
 
+/// Whether `getInfo` at hand-off time still describes the receiver that
+/// was offered. Another device at the same address must not receive the
+/// account.
+pub fn same_device(receiver: &Receiver, info: &Info) -> bool {
+    receiver
+        .device_id
+        .as_deref()
+        .is_some_and(|discovered| discovered == info.device_id)
+}
+
 /// Resolve advertisements before offering them as playback targets. This
 /// only reads device information; account credentials are sent on selection.
 /// Four probes run at a time, with two seconds per probe and six overall.
@@ -428,6 +438,25 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_receiver_whose_identity_changed_is_not_the_same_device() {
+        let info = |device_id: &str| Info {
+            device_id: device_id.into(),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        let receiver = |device_id: Option<&str>| Receiver {
+            name: "Living Room".into(),
+            device_id: device_id.map(Into::into),
+            address: "192.168.1.20".parse().unwrap(),
+            port: 5907,
+            path: "/".into(),
+        };
+        assert!(same_device(&receiver(Some("one")), &info("one")));
+        assert!(!same_device(&receiver(Some("one")), &info("two")));
+        assert!(!same_device(&receiver(None), &info("one")));
+        assert!(!same_device(&receiver(Some("")), &info("one")));
+    }
+
     #[test]
     fn receiver_handoff_uses_the_in_memory_playback_grant() {
         let stored = librespot_core::authentication::Credentials {
