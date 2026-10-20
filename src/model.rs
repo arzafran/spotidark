@@ -505,10 +505,72 @@ impl<T> CursorList<T> {
     }
 }
 
+/// A reload of a playlist list that is already on show. The shown list
+/// stays until every fresh page has arrived, then is replaced at once.
+#[derive(Default)]
+pub enum PlaylistsRefresh {
+    #[default]
+    Idle,
+    /// The fresh first page has not arrived; later pages belong to an
+    /// older chain.
+    Requested,
+    /// Fresh pages so far, and the offset of the one expected next.
+    Receiving {
+        playlists: Vec<Playlist>,
+        next: Option<u32>,
+    },
+}
+
+/// The details the edit dialog writes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaylistDetails {
+    pub name: String,
+    pub description: Option<String>,
+    pub public: Option<bool>,
+}
+
+impl PlaylistDetails {
+    pub fn of(playlist: &Playlist) -> Self {
+        Self {
+            name: playlist.name.clone(),
+            description: playlist.description.clone(),
+            public: playlist.public,
+        }
+    }
+
+    /// Writes these details; an unknown public flag leaves the shown one.
+    pub fn apply(&self, playlist: &mut Playlist) {
+        playlist.name.clone_from(&self.name);
+        playlist.description.clone_from(&self.description);
+        if self.public.is_some() {
+            playlist.public = self.public;
+        }
+    }
+
+    /// Puts back details read from a playlist, unknown flag included.
+    pub fn restore(&self, playlist: &mut Playlist) {
+        self.apply(playlist);
+        playlist.public = self.public;
+    }
+}
+
+/// An edit shown before Spotify confirmed it.
+#[derive(Clone, Debug)]
+pub struct PendingPlaylistEdit {
+    pub before: PlaylistDetails,
+    pub after: PlaylistDetails,
+}
+
 #[derive(Default)]
 pub struct Library {
     pub playlists: Loadable<Vec<Playlist>>,
     pub playlists_next: Option<u32>,
+    pub playlists_refresh: PlaylistsRefresh,
+    /// Edits shown before Spotify confirmed them, by playlist ID.
+    pub playlist_edits: HashMap<String, PendingPlaylistEdit>,
+    /// Playlists removed from the list before Spotify confirmed the
+    /// unfollow, with their position, so a failure can put them back.
+    pub removed_playlists: HashMap<String, (usize, Playlist)>,
     pub liked: PagedList<Arc<SavedTrack>>,
     pub albums: PagedList<SavedAlbum>,
     pub artists: CursorList<Artist>,

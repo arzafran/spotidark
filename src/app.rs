@@ -3005,10 +3005,17 @@ impl App {
     // ---- loading ---------------------------------------------------------------
 
     fn load_playlists(&mut self) {
-        if self.library.playlists.is_loading() {
+        if self.library.playlists.is_loading()
+            || !matches!(self.library.playlists_refresh, PlaylistsRefresh::Idle)
+        {
             return;
         }
-        self.library.playlists = Loadable::Loading;
+        if self.library.playlists.get().is_some() {
+            // The shown list stays until the fresh one is complete.
+            self.library.playlists_refresh = PlaylistsRefresh::Requested;
+        } else {
+            self.library.playlists = Loadable::Loading;
+        }
         self.library.playlists_next = None;
         self.backend.api(ApiRequest::MyPlaylists { offset: 0 });
     }
@@ -4001,6 +4008,34 @@ impl App {
         }
     }
 
+    /// Keeps edits and unfollows Spotify has not confirmed over a fetched
+    /// playlist list.
+    fn hold_playlist_changes(&self, playlists: &mut Vec<Playlist>) {
+        let library = &self.library;
+        playlists.retain(|playlist| !library.removed_playlists.contains_key(&playlist.id));
+        for playlist in playlists {
+            if let Some(edit) = library.playlist_edits.get(&playlist.id) {
+                edit.after.apply(playlist);
+            }
+        }
+    }
+
+    /// Changes a playlist wherever it is on show: its library entry and its
+    /// page header.
+    fn show_playlist_details(&mut self, id: &str, mut change: impl FnMut(&mut Playlist)) {
+        if let Some(page) = self.playlist_pages.get_mut(id)
+            && let Some(playlist) = page.playlist.get_mut()
+        {
+            change(playlist);
+        }
+        if let Some(playlists) = self.library.playlists.get_mut() {
+            playlists
+                .iter_mut()
+                .filter(|playlist| playlist.id == id)
+                .for_each(&mut change);
+        }
+    }
+
     fn set_playlist_cover(&mut self, id: &str, cover: &crate::playlist_cover::Cover) {
         if let Some(page) = self.playlist_pages.get_mut(id)
             && let Some(playlist) = page.playlist.get_mut()
@@ -4322,7 +4357,7 @@ impl App {
                     self.queue_cleared = None;
                     self.queue_shuffle_pending = None;
                 }
-                self.queue = Loadable::from_result(result);
+                self.queue.refresh(result);
                 self.reconcile_pending_queue();
                 if let Some(queue) = self.queue.get() {
                     let uris: Vec<String> = queue
@@ -4484,11 +4519,39 @@ impl App {
                 }
             }
             ApiResponse::MyPlaylists { offset, result } => match result {
-                Ok(page) => {
+                Ok(mut page) => {
                     let next_offset = page.next_offset();
-                    match &mut self.library.playlists {
-                        Loadable::Loaded(existing) if offset > 0 => existing.extend(page.items),
-                        slot => *slot = Loadable::Loaded(page.items),
+                    // A read can predate an edit or unfollow still in
+                    // flight. A reload's pages wait for that until shown.
+                    if matches!(self.library.playlists_refresh, PlaylistsRefresh::Idle) {
+                        self.hold_playlist_changes(&mut page.items);
+                    }
+                    match &mut self.library.playlists_refresh {
+                        PlaylistsRefresh::Idle => match &mut self.library.playlists {
+                            Loadable::Loaded(existing) if offset > 0 => existing.extend(page.items),
+                            slot => *slot = Loadable::Loaded(page.items),
+                        },
+                        refresh @ PlaylistsRefresh::Requested if offset == 0 => {
+                            *refresh = PlaylistsRefresh::Receiving {
+                                playlists: page.items,
+                                next: next_offset,
+                            };
+                        }
+                        PlaylistsRefresh::Receiving { playlists, next }
+                            if offset > 0 && *next == Some(offset) =>
+                        {
+                            playlists.extend(page.items);
+                            *next = next_offset;
+                        }
+                        // A page of the chain the reload replaced.
+                        PlaylistsRefresh::Requested | PlaylistsRefresh::Receiving { .. } => return,
+                    }
+                    if next_offset.is_none()
+                        && let PlaylistsRefresh::Receiving { mut playlists, .. } =
+                            std::mem::take(&mut self.library.playlists_refresh)
+                    {
+                        self.hold_playlist_changes(&mut playlists);
+                        self.library.playlists = Loadable::Loaded(playlists);
                     }
                     self.library.playlists_next = next_offset;
                     if next_offset.is_some() {
@@ -4513,13 +4576,26 @@ impl App {
                         }
                     }
                 }
-                Err(error) => {
-                    if offset == 0 {
+                Err(error) => match &self.library.playlists_refresh {
+                    PlaylistsRefresh::Idle if offset == 0 => {
                         self.library.playlists = Loadable::Failed(error.to_string());
-                    } else {
+                    }
+                    PlaylistsRefresh::Idle => {
                         self.toast_error(format!("Couldn't load more playlists: {error}"));
                     }
-                }
+                    PlaylistsRefresh::Requested if offset == 0 => {
+                        self.library.playlists_refresh = PlaylistsRefresh::Idle;
+                        self.toast_error(format!("Couldn't refresh your playlists: {error}"));
+                    }
+                    PlaylistsRefresh::Receiving { next, .. }
+                        if offset > 0 && *next == Some(offset) =>
+                    {
+                        self.library.playlists_refresh = PlaylistsRefresh::Idle;
+                        self.toast_error(format!("Couldn't refresh your playlists: {error}"));
+                    }
+                    // An error from the chain the reload replaced.
+                    PlaylistsRefresh::Requested | PlaylistsRefresh::Receiving { .. } => {}
+                },
             },
             ApiResponse::Playlist {
                 id,
@@ -4574,6 +4650,9 @@ impl App {
                     }
                     if let Some(listed) = self.library_entry(&id) {
                         playlist.fill_from(listed);
+                    }
+                    if let Some(edit) = self.library.playlist_edits.get(&id) {
+                        edit.after.apply(playlist);
                     }
                     if let Some(image) = pick_image(&playlist.images, 300) {
                         self.tint_for(Some(image));
@@ -4790,14 +4869,17 @@ impl App {
                 self.playlist_busy = false;
                 match result {
                     Ok(()) => {
+                        // The shown details are what Spotify now holds; a
+                        // read this soon could still tell the old ones.
+                        self.library.playlist_edits.remove(&id);
                         self.toast("Playlist updated");
-                        self.playlist_pages.remove(&id);
-                        self.load_playlists();
-                        if matches!(self.page(), Page::Playlist(current) if *current == id) {
-                            self.ensure_loaded(Page::Playlist(id));
-                        }
                     }
                     Err(error) => {
+                        if let Some(edit) = self.library.playlist_edits.remove(&id) {
+                            self.show_playlist_details(&id, |playlist| {
+                                edit.before.restore(playlist)
+                            });
+                        }
                         self.toast_error(format!("Couldn't update the playlist: {error}"))
                     }
                 }
@@ -4889,6 +4971,7 @@ impl App {
                 result,
             } => match result {
                 Ok(()) => {
+                    self.library.removed_playlists.remove(&id);
                     self.saved
                         .insert(format!("spotify:playlist:{id}"), followed);
                     self.toast(if followed {
@@ -4905,6 +4988,12 @@ impl App {
                 Err(error) => {
                     self.saved
                         .insert(format!("spotify:playlist:{id}"), !followed);
+                    if let Some((position, playlist)) = self.library.removed_playlists.remove(&id)
+                        && let Some(playlists) = self.library.playlists.get_mut()
+                        && !playlists.iter().any(|listed| listed.id == id)
+                    {
+                        playlists.insert(position.min(playlists.len()), playlist);
+                    }
                     self.toast_error(format!("Couldn't update the playlist: {error}"));
                 }
             },
@@ -7525,6 +7614,26 @@ impl App {
             } => {
                 self.dialog = None;
                 self.playlist_busy = true;
+                let shown = self
+                    .library_entry(&id)
+                    .or_else(|| self.playlist_pages.get(&id)?.playlist.get())
+                    .map(PlaylistDetails::of);
+                if let Some(before) = shown {
+                    let after = PlaylistDetails {
+                        name: name.clone(),
+                        description: Some(description.clone()),
+                        public,
+                    };
+                    self.library
+                        .playlist_edits
+                        .entry(id.clone())
+                        .or_insert_with(|| PendingPlaylistEdit {
+                            before,
+                            after: after.clone(),
+                        })
+                        .after = after.clone();
+                    self.show_playlist_details(&id, |playlist| after.apply(playlist));
+                }
                 self.backend.api(ApiRequest::UpdatePlaylist {
                     id,
                     name: Some(name),
@@ -7535,8 +7644,14 @@ impl App {
             Action::DeletePlaylist(id) => {
                 self.dialog = None;
                 self.saved.insert(format!("spotify:playlist:{id}"), false);
-                if let Some(playlists) = self.library.playlists.get_mut() {
+                if let Some(playlists) = self.library.playlists.get_mut()
+                    && let Some(position) = playlists.iter().position(|p| p.id == id)
+                {
+                    let removed = playlists.remove(position);
                     playlists.retain(|playlist| playlist.id != id);
+                    self.library
+                        .removed_playlists
+                        .insert(id.clone(), (position, removed));
                 }
                 self.backend
                     .api(ApiRequest::FollowPlaylist { id, follow: false });
@@ -10875,6 +10990,211 @@ mod tests {
         }
         let (current, _) = queue_uris(&app);
         assert_eq!(current.as_deref(), Some("spotify:track:a"));
+    }
+
+    /// A failed queue refresh keeps the queue on show.
+    #[test]
+    fn a_failed_queue_refresh_keeps_the_shown_queue() {
+        let mut app = headless_app();
+        app.queue = loaded_queue("spotify:track:a", &["spotify:track:b"]);
+        app.handle_api(ApiResponse::Queue {
+            seq: app.queue_seq,
+            result: Err(crate::api::ApiError::Network("offline".into())),
+        });
+        let (current, next) = queue_uris(&app);
+        assert_eq!(current.as_deref(), Some("spotify:track:a"));
+        assert_eq!(next, vec!["spotify:track:b"]);
+    }
+
+    fn listed_playlist(id: &str) -> Playlist {
+        Playlist {
+            id: id.into(),
+            name: id.into(),
+            uri: format!("spotify:playlist:{id}"),
+            ..Playlist::default()
+        }
+    }
+
+    fn listed_ids(app: &App) -> Option<Vec<String>> {
+        app.library
+            .playlists
+            .get()
+            .map(|playlists| playlists.iter().map(|p| p.id.clone()).collect())
+    }
+
+    fn playlists_page(offset: u32, ids: &[&str], more: bool) -> crate::api::models::Page<Playlist> {
+        crate::api::models::Page {
+            items: ids.iter().map(|id| listed_playlist(id)).collect(),
+            total: 0,
+            limit: ids.len() as u32,
+            offset,
+            next: more.then(|| "next".into()),
+        }
+    }
+
+    /// Reloading the shown playlist list after an edit keeps every
+    /// playlist on show until the fresh list is complete, then swaps it in.
+    #[test]
+    fn a_playlist_reload_keeps_the_shown_list_until_it_is_complete() {
+        let mut app = headless_app();
+        let shown = vec!["a".to_string(), "b".into(), "c".into()];
+        app.library.playlists = Loadable::Loaded(vec![
+            listed_playlist("a"),
+            listed_playlist("b"),
+            listed_playlist("c"),
+        ]);
+        app.load_playlists();
+        assert_eq!(listed_ids(&app), Some(shown.clone()), "nothing vanishes");
+
+        // A page of an older chain is not mixed into the fresh list.
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 3,
+            result: Ok(playlists_page(3, &["old"], false)),
+        });
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(playlists_page(0, &["a", "d"], true)),
+        });
+        assert_eq!(
+            listed_ids(&app),
+            Some(shown.clone()),
+            "a partial list is not shown"
+        );
+        // An unfollow made while the reload is out is held over its pages.
+        app.apply(
+            Action::DeletePlaylist("a".into()),
+            &egui::Context::default(),
+        );
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 2,
+            result: Ok(playlists_page(2, &["e"], false)),
+        });
+        assert_eq!(listed_ids(&app), Some(vec!["d".into(), "e".into()]));
+        app.handle_api(ApiResponse::PlaylistFollowChanged {
+            id: "a".into(),
+            followed: false,
+            result: Err(crate::api::ApiError::Network("offline".into())),
+        });
+        let fresh = vec!["a".to_string(), "d".into(), "e".into()];
+        assert_eq!(listed_ids(&app), Some(fresh.clone()));
+
+        // A failed reload keeps the list, and a later one may still run.
+        app.load_playlists();
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Err(crate::api::ApiError::Network("offline".into())),
+        });
+        assert_eq!(listed_ids(&app), Some(fresh));
+        assert!(matches!(
+            app.library.playlists_refresh,
+            PlaylistsRefresh::Idle
+        ));
+
+        // With nothing on show yet, the first load still shows loading.
+        app.library = Library::default();
+        app.load_playlists();
+        assert!(app.library.playlists.is_loading());
+    }
+
+    /// A rename shows at once in the list and the page header, survives a
+    /// read from before it, keeps the loaded page, and a failure puts the
+    /// old details back.
+    #[test]
+    fn a_rename_shows_at_once_and_a_failure_puts_the_old_name_back() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        let old = Playlist {
+            description: Some("Before".into()),
+            public: Some(true),
+            ..listed_playlist("Old")
+        };
+        let id = old.id.clone();
+        app.library.playlists = Loadable::Loaded(vec![old.clone()]);
+        app.playlist_pages.insert(
+            id.clone(),
+            PlaylistPage {
+                playlist: Loadable::Loaded(old.clone()),
+                ..Default::default()
+            },
+        );
+        let shown = |app: &App| {
+            let listed = &app.library.playlists.get().unwrap()[0];
+            let header = app.playlist_pages[&id].playlist.get().unwrap();
+            assert_eq!(PlaylistDetails::of(listed), PlaylistDetails::of(header));
+            PlaylistDetails::of(listed)
+        };
+        let rename = |app: &mut App| {
+            app.apply(
+                Action::UpdatePlaylist {
+                    id: id.clone(),
+                    name: "New".into(),
+                    description: "After".into(),
+                    public: Some(false),
+                },
+                &ctx,
+            )
+        };
+        let renamed = PlaylistDetails {
+            name: "New".into(),
+            description: Some("After".into()),
+            public: Some(false),
+        };
+
+        rename(&mut app);
+        assert_eq!(shown(&app), renamed, "the new details show at once");
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![old.clone()],
+                ..Default::default()
+            }),
+        });
+        assert_eq!(shown(&app), renamed, "a read from before does not undo it");
+
+        app.handle_api(ApiResponse::PlaylistUpdated {
+            id: id.clone(),
+            result: Err(crate::api::ApiError::Network("offline".into())),
+        });
+        assert_eq!(shown(&app), PlaylistDetails::of(&old));
+        assert_eq!(app.toasts.last().unwrap().kind, ToastKind::Error);
+
+        rename(&mut app);
+        app.handle_api(ApiResponse::PlaylistUpdated {
+            id: id.clone(),
+            result: Ok(()),
+        });
+        assert_eq!(shown(&app), renamed);
+        assert!(
+            app.playlist_pages.contains_key(&id),
+            "the loaded page stays"
+        );
+        assert!(app.library.playlist_edits.is_empty());
+    }
+
+    /// A failed unfollow puts the playlist back where it was in the list.
+    #[test]
+    fn a_failed_unfollow_puts_the_playlist_back_where_it_was() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.library.playlists = Loadable::Loaded(vec![
+            listed_playlist("a"),
+            listed_playlist("b"),
+            listed_playlist("c"),
+        ]);
+        app.apply(Action::DeletePlaylist("b".into()), &ctx);
+        assert_eq!(listed_ids(&app), Some(vec!["a".into(), "c".into()]));
+
+        app.handle_api(ApiResponse::PlaylistFollowChanged {
+            id: "b".into(),
+            followed: false,
+            result: Err(crate::api::ApiError::Network("offline".into())),
+        });
+        assert_eq!(
+            listed_ids(&app),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(app.saved.get("spotify:playlist:b"), Some(&true));
+        assert_eq!(app.toasts.last().unwrap().kind, ToastKind::Error);
     }
 
     /// A pending addition is not restored after its track starts.
