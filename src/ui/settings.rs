@@ -86,7 +86,7 @@ pub(crate) fn personal_app_instructions(
             .clicked()
         {
             actions.push(Action::OpenUrl(
-                "https://spotifast.rocks/make-it-even-faster/".into(),
+                "https://github.com/darkroomengineering/spotidark/blob/main/docs/_guide/make-it-even-faster.md".into(),
             ));
         }
     });

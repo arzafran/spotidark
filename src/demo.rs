@@ -1817,7 +1817,7 @@ mod tests {
             (
                 "Setup guide",
                 Role::Button,
-                "https://spotifast.rocks/make-it-even-faster/",
+                "https://github.com/darkroomengineering/spotidark/blob/main/docs/_guide/make-it-even-faster.md",
             ),
         ] {
             let (ctx, mut app) = accessible_app(&format!("personal-app-link-{label}"));
