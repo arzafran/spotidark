@@ -1,25 +1,25 @@
 ---
 layout: home
-title: Spotifast
-description: A fast, lightweight Spotify app for Linux, macOS, and Windows.
+title: Spotidark
+description: A native Spotify client for macOS, Windows, and Linux by Darkroom Engineering, based on Spotifast.
 permalink: /
 hero:
-  name: Spotifast
+  name: Spotidark
   text: Spotify, native and fast
-  tagline: Formerly Fastpotify. A lightweight Spotify app for Linux, macOS, and Windows. Listen on your computer, browse your music, and control your other devices.
+  tagline: Darkroom Engineering's fork of Spotifast by Carmine Paolino. A lightweight Spotify app for macOS, Windows, and Linux. Listen on your computer, browse your music, and control your other devices.
   actions:
     - theme: brand
       text: Download
       link: /download/
     - theme: alt
-      text: What is Spotifast?
-      link: /what-is-spotifast/
+      text: What is Spotidark?
+      link: /what-is-spotidark/
     - theme: alt
       text: GitHub
-      link: https://github.com/crmne/spotifast
+      link: https://github.com/darkroomengineering/spotidark
   image:
     src: /screenshot.png
-    alt: "Spotifast Home with the playlist library, recommendations, queue, and player visible"
+    alt: "Spotidark Home with the playlist library, recommendations, queue, and player visible"
     width: 2018
     height: 1198
 
@@ -35,7 +35,7 @@ features:
     details: Browse playlists, Liked Songs, albums, artists, and podcasts. Search the catalogue and edit playlists you own.
   - icon: 🎨
     title: Themes
-    details: Choose light, dark, or your own colours. On Omarchy, Spotifast can follow your desktop theme as it changes, while the music keeps playing.
+    details: Choose light, dark, or your own colours. On Omarchy, Spotidark can follow your desktop theme as it changes, while the music keeps playing.
   - icon: 📻
     title: Winamp mini player
     details: Bring back the classic Winamp look, with skins, a playlist, sound controls, and animations that move to your music.
@@ -52,7 +52,7 @@ features:
   - icon: 🔓
     title: Open source
     details: Free to use, study, and improve. Explore the code, report a problem, or help build the next version.
-    link: https://github.com/crmne/spotifast
+    link: https://github.com/darkroomengineering/spotidark
     link_text: Read the source
 ---
 
@@ -70,12 +70,12 @@ sharp. [See the mini player in detail](/winamp/).
 
 ## MilkDrop with more than 10,000 presets
 
-On first use, Spotifast automatically downloads the original MilkDrop 2
+On first use, Spotidark automatically downloads the original MilkDrop 2
 presets and projectM's Cream of the Crop collection. These visual designs
 react to music playing on your computer, in a resizable window or full screen.
 [See the controls and preset details](/milkdrop/).
 
-<video class="milkdrop-showcase" autoplay loop muted playsinline preload="metadata" poster="/assets/images/milkdrop-poster.jpg" aria-label="MilkDrop presets reacting to music in Spotifast">
+<video class="milkdrop-showcase" autoplay loop muted playsinline preload="metadata" poster="/assets/images/milkdrop-poster.jpg" aria-label="MilkDrop presets reacting to music in Spotidark">
   <source src="/assets/images/milkdrop.mp4" type="video/mp4">
 </video>
 

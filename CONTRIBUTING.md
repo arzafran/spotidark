@@ -1,13 +1,14 @@
 # Contributing to Spotidark
 
-This is Darkroom Engineering's fork of Spotifast. Submit fork-specific issues
-and changes to [darkroomengineering/spotidark](https://github.com/darkroomengineering/spotidark).
-The product boundaries, engineering guidance, and checks below are preserved
-from Spotifast and apply to this fork. References to Spotifast describe the
-upstream project; see [README.md](README.md) for Spotidark's identity and current
-distribution status. Credit upstream contributors and preserve the MIT notice.
+Spotidark is Darkroom Engineering's fork of
+[Spotifast](https://github.com/crmne/spotifast) by Carmine Paolino and
+contributors. Submit issues and changes to
+[darkroomengineering/spotidark](https://github.com/darkroomengineering/spotidark).
+The product boundaries, engineering guidance, and checks below come from
+Spotifast and apply to this fork. Credit upstream contributors and preserve
+the MIT notice.
 
-Spotifast is a native Spotify client. Changes should improve the
+Spotidark is a native Spotify client. Changes should improve the
 desktop app without adding a browser, fallback services, or another backend.
 
 ## Before opening an issue
@@ -23,13 +24,13 @@ project.
 Some boundaries come from Spotify or from upstream libraries:
 
 - Local playback requires Spotify Premium because librespot requires it.
-- Spotify Lossless is not available through librespot. Spotifast will
+- Spotify Lossless is not available through librespot. Spotidark will
   reconsider it if librespot gains lawful upstream support; proposals that
   depend on bypassing Spotify's DRM are out of scope.
 - Spotify tracks must come from Spotify. Substituting audio from YouTube,
   Piped, `yt-dlp`, or another catalogue is out of scope.
-- Spotifast will not embed a browser engine, add telemetry, or introduce a
-  Spotifast-operated service.
+- Spotidark will not embed a browser engine, add telemetry, or introduce a
+  Spotidark-operated service.
 
 [What Spotify Lets a Client Do](docs/_reference/what-spotify-allows.md)
 lists what each of the three surfaces offers and the requests none of them
@@ -84,7 +85,7 @@ implementation and regression tests live in the Copilot Triage repository.
 
 ## Pull requests
 
-Keep each pull request to one change. Explain why it belongs in Spotifast,
+Keep each pull request to one change. Explain why it belongs in Spotidark,
 what changed, and how you tested it. Avoid unrelated formatting, refactors,
 generated prose, and large mechanical rewrites.
 
@@ -129,6 +130,8 @@ Run the same checks CI runs before submitting:
 
 ```sh
 python3 packaging/test-launchers.py
+python3 packaging/flatpak/test-metainfo.py
+python3 packaging/test-release.py
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -168,18 +171,16 @@ Translation changes also need `.github/scripts/update-translations.sh --check`,
 using GNU gettext tools with Rust support. Run the script without `--check` when
 translatable source strings change, and review any fuzzy or missing entries in
 the updated PO files. Normal Cargo builds compile the catalogs without gettext
-tools. See [Translating Spotifast](docs/_reference/translating.md) for the pilot
+tools. See [Translating Spotidark](docs/_reference/translating.md) for the pilot
 scope and contributor workflow.
 
-Documentation deployments take their canonical URL from the domain configured
-in GitHub Pages. When changing domains, configure DNS and GitHub Pages before
-redeploying; the previous hostname keeps working until that switch. Renamed
-guides use `jekyll-redirect-from` to preserve their old URLs.
+The documentation site in `docs/` is built by CI but not deployed from this
+repository; the inherited Pages workflow runs only in `crmne/spotifast`.
 
 When changing `Cargo.lock` or `flake.nix`, also verify `nix build .#default`
 on a Nix host or wait for the Nix CI job. A package-version-only lockfile
-change can change the vendor hash. Releases must wait for all required CI
-jobs on the version commit before the tag is pushed.
+change can change the vendor hash. Every successful CI run on `main` publishes
+a release; see [releases and automatic updates](docs/releases.md).
 
 By contributing, you agree that your contribution is licensed under the
 project's MIT License.

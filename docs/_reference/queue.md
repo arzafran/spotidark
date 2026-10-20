@@ -23,7 +23,7 @@ Starting and resuming are separate actions. With Shuffle off, a playlist's
 Double-clicking a row starts there, including with Shuffle on. **Play** in
 the player bar resumes the current song at its paused position.
 
-Since 0.8.0, starting a playlist in its original order explicitly
+Starting a playlist in its original order explicitly
 names its first available song from the loaded prefix. If that prefix is not
 loaded, it requests playlist position zero. A page loaded from the middle
 never becomes the beginning. This keeps the full Spotify playlist context;
@@ -65,19 +65,19 @@ unplayable view disables Play instead of starting the unfiltered context.
    below stay. It only shows while this computer is the player, because
    that is the only queue the app can actually clear.
 
-8. **Changes appear immediately.** Spotifast updates the queue before Spotify
+8. **Changes appear immediately.** Spotidark updates the queue before Spotify
    confirms the change. For local playback, it updates its own player directly.
    Toggling shuffle rechecks the queue so the new playback order appears
    promptly without waiting for the song to finish.
 
-9. **Closing the app keeps the queue.** Spotifast saves it locally. When you
+9. **Closing the app keeps the queue.** Spotidark saves it locally. When you
    resume the last song, it restores your queued songs and playlist position.
 
 10. **Old answers from Spotify are ignored.** Queue responses can be a few
-    seconds late. Spotifast ignores stale responses and asks again. Your
+    seconds late. Spotidark ignores stale responses and asks again. Your
     changes stay visible while it waits for confirmation.
 
-Since 0.8.0, selecting several playlist rows and choosing
+Selecting several playlist rows and choosing
 **Add to queue** preserves repeated occurrences in their selected order.
 For example, selecting B, C, B adds all three rows. A repeated click still
 counts once, and the notification reports only the rows actually added.

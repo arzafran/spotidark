@@ -1,13 +1,12 @@
 ---
-redirect_from: /using-fastpotify/
 title: Everyday Use
-description: Play music, arrange playlists, find lyrics, and make Spotifast your own.
+description: Play music, arrange playlists, find lyrics, and make Spotidark your own.
 nav_order: 3
 ---
 
 ## Middle-click autoscroll
 
-On Windows, since 0.8.0, middle-click a scrolling list or its empty background,
+On Windows, middle-click a scrolling list or its empty background,
 then move the pointer
 away from the starting point. That list follows the pointer, faster as the
 distance grows. Moving across another pane keeps the original list in control.
@@ -16,7 +15,7 @@ Click again, press Esc, turn the wheel, or switch to another window to stop.
 Buttons and text fields keep their normal middle-click behavior.
 
 This works automatically on Windows, with no setting to enable. Linux and
-macOS retain their existing middle-click behavior.
+macOS keep their normal middle-click behavior.
 
 ## Scrolling shelves
 
@@ -26,20 +25,20 @@ the surrounding page stays put. Release `Shift` to scroll the page normally.
 
 ## Dragging beyond the visible list
 
-Since 0.8.0, hold a dragged song near the top or
+Hold a dragged song near the top or
 bottom of an editable playlist's visible area to scroll. Scrolling gets faster
 closer to the edge and stops when you move away or release the mouse. This
 lets you move a song from the end to the beginning without dropping it along
 the way. Clear filters and sorting before reordering playlist songs.
 
-Since 0.8.0, drag a song from the player bar, the queue, or another
+Drag a song from the player bar, the queue, or another
 list into an open editable playlist. The line between rows marks its insertion
 position. Dropping below the last row appends; the blank area of an empty
 playlist accepts its first song. The source song stays in its list or queue,
 and playback continues unchanged. Dragging a row within the same playlist
 still moves that row.
 
-Since 0.8.0, select several songs with `Ctrl`-click (`Cmd`-click
+Select several songs with `Ctrl`-click (`Cmd`-click
 on macOS) or `Shift`-click, then drag any selected row. The whole selection
 travels together in its displayed order, even if you selected the rows in
 a different order. The preview names the first song and counts the rest.
@@ -61,7 +60,7 @@ playlist or reorder its entries. Only the list under the pointer scrolls.
 
 ## Starting a playlist and resuming
 
-Since 0.8.0, with Shuffle off and the playlist in its original
+With Shuffle off and the playlist in its original
 order, its **Play** button explicitly starts at the first available song.
 The selected song appears in the player immediately, including while local
 playback reconnects. The full playlist remains the playback source, even
@@ -84,10 +83,10 @@ the filter restores the original view. Existing Shuffle behavior is unchanged.
 
 ## Refreshing a playlist
 
-Since 0.8.0, choose **Refresh** in a playlist's **…** menu to reload
+Choose **Refresh** in a playlist's **…** menu to reload
 its details and songs, including changes made in another Spotify client. The
 menu item reads **Refreshing…** and is disabled while loading. Current songs,
-filtering and sorting stay visible. Spotifast finishes saving your edits before
+filtering and sorting stay visible. Spotidark finishes saving your edits before
 loading changes from Spotify. If loading fails, your songs stay visible and
 you can choose **Retry**.
 
@@ -100,21 +99,21 @@ sidebar is not in compact mode.
 
 ## Search from a launcher
 
-**In development, not included in 0.8.0:** a Spotify search link opens Search
-and fills the box without starting playback. To try it in a development build,
-set a launcher or keyboard shortcut to run:
+A Spotify search link opens Search
+and fills the box without starting playback. Set a launcher or keyboard
+shortcut to run:
 
 ```sh
-spotifast 'https://open.spotify.com/search/here%20comes%20the%20sun'
+spotidark 'https://open.spotify.com/search/here%20comes%20the%20sun'
 ```
 
 This starts the app if needed or opens its existing window. When signed out,
 the latest search link waits for sign-in. Use `https://open.spotify.com/search`
 without a query to open an empty, focused search box.
 
-On Linux, `playerctl --player=fastpotify open` accepts the same search link
-when the app is running. Links to songs, albums, and playlists still start
-playback as before.
+On Linux, `playerctl --player=spotidark open` accepts the same search link
+when the app is running. Links to songs, albums, and playlists start
+playback.
 
 ## Finding a setting
 
@@ -127,7 +126,7 @@ field to see everything again.
 Right-click a search, filter, settings or playlist-editing text field for
 **Cut**, **Copy**, **Paste** and **Select all**. Cut and Copy require a text
 selection. The usual keyboard shortcuts, including Undo, still work.
-Since 0.8.0, Ctrl, Cmd and Alt arrow keys move the caret while
+Ctrl, Cmd and Alt arrow keys move the caret while
 a text field has focus. Playback and navigation shortcuts on those keys
 remain available from song rows and other controls.
 
@@ -149,12 +148,13 @@ search. The playback shortcuts remain available; unmodified letter and
 Space shortcuts yield to the focused control.
 
 This is the first part of screen-reader support. Windows testing with NVDA
-remains tracked in [#262](https://github.com/crmne/spotifast/issues/262).
+is tracked upstream in
+[Spotifast #262](https://github.com/crmne/spotifast/issues/262).
 Winamp skins do not yet have equivalent accessibility coverage.
 
 ## Library order
 
-Since 0.8.0, the menu below the Library filters selects an order
+The menu below the Library filters selects an order
 for each section. **Name** and **Recently played** are available throughout.
 Albums and podcasts also offer **Recently added**, using their actual save
 dates. Spotify does not supply equivalent dates for followed playlists or
@@ -163,10 +163,10 @@ dates come last.
 
 **Spotify custom order** follows your playlist order and folders from Spotify.
 Set up playback on this computer to load that order. Your playlists stay
-visible while it loads, and Spotifast remembers the last order for your account.
-Items you pin in Spotifast remain at the top, including items from a closed
+visible while it loads, and Spotidark remembers the last order for your account.
+Items you pin in Spotidark remain at the top, including items from a closed
 folder. Sorting or dragging Library items changes their order only in
-Spotifast; it does not rearrange your Spotify library.
+Spotidark; it does not rearrange your Spotify library.
 
 Drag playlists to choose **Local custom order**. New playlists appear below the
 pinned group. Selecting **Name**, **Recently played** or **Spotify custom order**
@@ -183,7 +183,7 @@ Liked Songs starts pinned at the top. Drag it between pins to choose its
 position, or below the pin block to unpin it and put it in **Local custom
 order**. Other pins can sit above it. Its right-click menu also offers **Unpin**
 and **Pin to top**; pinning adds it after your existing pins. The arrangement
-survives restarting Spotifast and switching sort choices.
+survives restarting Spotidark and switching sort choices.
 
 When unpinned, Liked Songs follows **Name** or **Recently played** like the other
 rows. In **Spotify custom order**, it appears after the playlists because it
@@ -197,14 +197,14 @@ bullet; each artist name remains a separate link.
 
 ## Windows taskbar controls
 
-Since 0.8.0, hovering Spotifast's taskbar button offers **Previous**,
+Hovering Spotidark's taskbar button offers **Previous**,
 **Play/Pause**, and **Next** beneath its window preview. They control the same
 playing device as the player bar, update immediately, and are disabled when
 there is no song or the device refuses controls. The icons follow the system
 appearance and display scaling.
 
-Since 0.8.0, clicking or double-clicking the Windows tray icon shows
-and raises Spotifast. Use **Show or hide Spotifast** in the tray menu to hide
+Clicking or double-clicking the Windows tray icon shows
+and raises Spotidark. Use **Show or hide Spotidark** in the tray menu to hide
 it again.
 
 Closing to the tray removes the window and its preview. Reopening the main
@@ -215,13 +215,13 @@ is closed.
 For the Winamp mini player, turn off **Show in taskbar** under
 **Settings > Winamp skins**, or **Show in taskbar** in its options menu.
 The choice survives restarts. The mini player stays visible; the tray icon,
-**Ctrl+M**, the skin logo, and launching Spotifast again remain ways to reach
+**Ctrl+M**, the skin logo, and launching Spotidark again remain ways to reach
 the app. Returning to the main window always restores its taskbar button.
 Changing the option while the mini player is open replaces that window while
 playback continues. This setting is available on Windows; it does not change
 Linux panels or the macOS Dock.
 
-On Windows, since 0.8.0, the mini player starts on the current desktop if its
+On Windows, the mini player starts on the current desktop if its
 saved title bar is outside every connected monitor’s work area. Positions on
 connected secondary monitors still restore. Reinstalling preserves settings;
 it is not needed to recover a position left on an unplugged display.
@@ -234,9 +234,9 @@ others.
 Use your desktop's window rule or shortcut instead. In KDE Plasma, configure
 **Keep Window Above Others** under **Settings > Keyboard > Shortcuts >
 Window Management**. Your saved preference remains available when you use
-Spotifast on Windows, macOS, or X11 again.
+Spotidark on Windows, macOS, or X11 again.
 
-Since 0.8.0, the top bar reserves room for the device and update
+The top bar reserves room for the device and update
 badges beside Search. In narrow windows those badges show only their icons.
 The bar stays above the page. Library, Queue and Lyrics keep their full height.
 Hover to read the device name or available version; click to open the device
@@ -245,15 +245,15 @@ picker or update window.
 ## Recent
 
 The queue panel's second tab combines Spotify's history with tracks played
-through Spotifast, which Spotify does not record.
+through Spotidark, which Spotify does not record.
 
-Since 0.8.0, choosing any Recent row starts that song on its own,
+Choosing any Recent row starts that song on its own,
 and the player bar shows the selection immediately while playback starts.
 
 A song is added after about 30 seconds, or halfway through a shorter song.
 Paused time and seeking do not count.
 
-Since 0.8.0, each repeat remains a separate play, including songs
+Each repeat remains a separate play, including songs
 shorter than a minute. A newly loaded local repeat earns its own listening
 time; pausing or seeking the current play does not create another entry.
 The same play reported both locally and by Spotify appears once.
@@ -262,12 +262,12 @@ The local list is stored in `history.json` and is never uploaded. Settings →
 Storage shows its location and has a **Clear history** button.
 
 On Windows, the main window's minimize, maximize, and close buttons share the
-top bar with Spotifast's controls. Drag an empty part of that bar to move or
+top bar with Spotidark's controls. Drag an empty part of that bar to move or
 snap the window, and drag a window edge or corner to resize it.
 
 ## Playlist covers
 
-**In development, not included in 0.8.0:** open a playlist you own and choose
+Open a playlist you own and choose
 **Edit details → Change cover**. Select a
 JPEG or PNG, check the preview, then choose **Upload cover**. Cancelling the
 picker leaves your previous selection intact. An upload error keeps the
@@ -283,7 +283,7 @@ Choose the microphone button in the player bar, or press **L**, to open lyrics.
 Synced lyrics follow the playing line automatically. Scroll to pause following,
 choose **Follow** to resume it, or choose a line to jump to that part of the song.
 
-**In development, not included in 0.8.0:** the expand button opens lyrics in
+The expand button opens lyrics in
 full screen. Press **Esc** or choose the shrink button to return to your previous
 window size. In full screen, the waveform button reduces or restores movement
 in the scrolling and highlights.

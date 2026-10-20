@@ -1,121 +1,46 @@
 ---
-title: The Rename
-description: How existing installations, commands, settings and links survive the new name.
+title: Fork Identity
+description: The names Spotidark uses for its command, files, credentials and desktop integration, and the upstream names it keeps.
 ---
 
-Fastpotify is now **Spotifast**, at [spotifast.rocks](https://spotifast.rocks/).
-Version 0.8.0 is the first release with the new name. Releases through 0.7.1
-use the Fastpotify name.
+Spotidark is Darkroom Engineering's fork of
+[Spotifast](https://github.com/crmne/spotifast) by Carmine Paolino and
+contributors, under the MIT license. It has its own app identity, so it does
+not share settings, sign-ins or desktop integration with Spotifast and can be
+installed beside it. Spotidark does not import or clear Spotifast's data; sign
+in again after switching.
 
-## Existing installations
+## Spotidark names
 
-Settings, saved sign-ins, local pins, history, caches and window positions stay
-where they are for native packages. Flatpak's new application ID uses a new
-data directory, with migration instructions below. Saved
-Spotify Connect names also stay as you chose them; new settings use Spotifast.
+| What | Name | Defined in |
+| --- | --- | --- |
+| Product | Spotidark | `README.md` |
+| Command | `spotidark` | `Cargo.toml` (`[[bin]]`) |
+| Settings, state and cache directories | `ProjectDirs` for `engineering` / `darkroom` / `spotidark` | `src/paths.rs` |
+| Log file | `spotidark.log` in the state directory | `src/paths.rs` |
+| Credential-store service | `engineering.darkroom.spotidark` | `src/credentials.rs` |
+| macOS bundle ID | `engineering.darkroom.spotidark` | `packaging/macos/Info.plist` |
+| Linux desktop entry | `spotidark.desktop`, `Icon=spotidark`, `StartupWMClass=spotidark` | `packaging/applications/spotidark.desktop` |
+| MPRIS player name | `spotidark` (`playerctl --player=spotidark`) | `src/mpris.rs` |
+| Default Spotify Connect name | `Spotidark` | `src/settings.rs` |
+| Main window state | `app.ron` in eframe's `spotidark` storage directory | `src/entrypoint.rs` |
+| Omarchy hook and template | `spotidark-theme`, `spotidark.json.tpl` | `contrib/omarchy/`, `src/theme/omarchy.rs` |
+| Windows installer | `spotidark-windows.exe`, installed to `Programs\Spotidark` for the current user | `packaging/windows/fastpotify.iss` |
 
-The `spotifast` and `fastpotify` commands open and control the same application.
-Linux packages provide `spotifast` as an alias, without installing a second
-copy of the app. Existing `playerctl --player=fastpotify` commands keep working.
+[Settings & Files](/settings-and-files/) lists the full paths on each system.
 
-On `main`, after 0.8.0, native Linux launchers use `spotifast.desktop`, with
-`Icon=spotifast` and `StartupWMClass=spotifast`. Wayland windows and the desktop
-entry reported through MPRIS use the same identity. Flatpak uses its full
-`rocks.spotifast.Spotifast` ID instead. The main window still reads its existing
-`fastpotify/app.ron` state, so geometry and interface preferences survive.
-The mini player's state remains separate.
+## Upstream names kept on purpose
 
-After installing the updated launcher, select it again for any pinned desktop
-shortcut or custom launcher command that explicitly names `fastpotify.desktop`.
-Run `xdg-mime default spotifast.desktop x-scheme-handler/spotify` to choose it
-for Spotify links. Published 0.8.0 packages retain their old desktop filename
-and window identity until an application update; their executable bytes are
-unchanged by the package rename.
+| What | Name | Why |
+| --- | --- | --- |
+| Rust package and library | `fastpotify` | Keeps upstream merges straightforward; see `README.md` |
+| Compatibility commands | `spotifast`, `fastpotify` | Build from `src/spotifast.rs` and `src/main.rs`; they start Spotidark with the same storage and controls, and are not needed to run it |
+| macOS bundle executable | `fastpotify` inside `Spotidark.app` | `packaging/macos/Info.plist` |
+| Windows installer script | `packaging/windows/fastpotify.iss` | File name only; it builds the Spotidark installer |
+| Local Liked Songs pin key | `fastpotify:liked-songs` | Stored in `settings.json`, never sent to Spotify; `src/settings.rs` |
+| Update staging directory | `.fastpotify-update-*` beside the app | `src/updates/install.rs` |
+| Translation template | `assets/i18n/fastpotify.pot` | Source template for every PO file |
 
-AUR packages are now `spotifast`, `spotifast-bin` and `spotifast-git`.
-The old packages have a packaging-only update that announces the move.
-Install the matching new package and accept the replacement, for example:
-
-```sh
-yay -S spotifast-bin
-```
-
-There is no need to uninstall first or remove settings. The source and binary
-release packages still use the same 0.8.0 application code. The `-git` variant
-continues to build the current development revision.
-
-The Homebrew cask is now `crmne/tap/spotifast`. Its rename metadata lets
-Homebrew migrate existing installations during updates, or explicitly with
-`brew migrate --cask fastpotify` after updating the tap. DEB/RPM packages are
-also named `spotifast` and declare replacement of `fastpotify`.
-Nix exposes `spotifast` and, on macOS, `spotifast-app`, alongside the old
-attribute names. Community-maintained distribution packages may still use
-the old name until their maintainers update them.
-
-## Updates and packaging
-
-Public release downloads use the `spotifast-` prefix. The 0.8.0 native downloads
-were renamed without changing their bytes. Flatpak was repackaged with its
-new application ID while retaining the original executable. Byte-identical
-native `fastpotify-` compatibility downloads remain for installed update clients that request
-those exact filenames, with both names recorded in `checksums.txt`. The compatibility command keeps its `fastpotify VERSION`
-response. The Spotifast command reports `spotifast VERSION`; new update clients
-accept either name and still require the exact expected version and checksum.
-
-New macOS installations use `Spotifast.app`. The bundle ID remains
-`me.paolino.fastpotify`, and its internal executable remains `fastpotify`.
-The disk image also includes a hidden, signed copy named `Fastpotify.app` for
-older updaters that require that path. Updating an existing installation
-preserves its current bundle location. Homebrew updates remain owned by
-Homebrew, whichever bundle name is installed.
-
-Windows keeps its original installer ID, registry identities and installation
-directory. Its app name and new shortcuts say Spotifast. The previous command
-remains installed for existing shortcuts and scripts.
-
-The protected credential-store service, MPRIS bus name and single-instance
-protocol retain their original identities for existing integrations.
-
-## Flatpak
-
-The Spotifast Flatpak bundle uses **`rocks.spotifast.Spotifast`**. This is a separate
-Flatpak application, so install the new bundle and remove the old application.
-The repackaged 0.8.0 bundle is available from the [download page](/download/)
-and contains the original 0.8.0 executable.
-
-To retain settings, local pins and history, quit the old application. Before
-the first launch of the new one, copy its data directory:
-
-```sh
-old_data="$HOME/.var/app/rocks.fastpotify.Fastpotify"
-new_data="$HOME/.var/app/rocks.spotifast.Spotifast"
-test -d "$old_data" && test ! -e "$new_data" && cp -a "$old_data" "$new_data"
-```
-
-This leaves the original directory intact and refuses to overwrite an existing
-new profile. If you have already opened the new application, retain that profile
-or move it aside before copying. Protected sign-ins are scoped to the original
-state directory, so sign in again after switching.
-
-Install the new bundle from the [download page](/download/), then run it:
-
-```sh
-flatpak install --user ~/Downloads/spotifast-v0.8.0-x86_64.flatpak
-flatpak run rocks.spotifast.Spotifast
-```
-
-After checking the new installation, remove the old one:
-
-```sh
-flatpak uninstall --user rocks.fastpotify.Fastpotify
-```
-
-Use `--system` instead of `--user` if the old application was installed
-system-wide. Uninstalling without `--delete-data` retains its data for recovery.
-
-## Website links
-
-The guides now live at `/using-spotifast/` and `/what-is-spotifast/`.
-`jekyll-redirect-from` generates redirects from their old Fastpotify URLs.
-The download page continues to link to the existing stable artifacts until a
-new release is available.
+The inherited Homebrew, AUR, Flatpak and Linux package recipes still use
+Spotifast names. They are upstream reference material and do not publish
+Spotidark; see [Release packaging](/packaging/).
