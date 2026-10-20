@@ -120,7 +120,7 @@ jobs:
   nix:
     name: Nix package
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: wimpysworld/nothing-but-nix@dd6ef566962bfa4656301706035da97ebbe90e9b # v9
