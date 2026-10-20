@@ -210,7 +210,7 @@ opt-level = 0
 # which GitHub's windows-latest images no longer carry; the fork lets an
 # explicit CMAKE_GENERATOR win. Drop when upstream takes the change.
 [patch.crates-io]
-projectm-sys = { git = "https://github.com/crmne/projectm-rs", branch = "respect-cmake-generator" }
+projectm-sys = { git = "https://github.com/crmne/projectm-rs", rev = "454f38c50a968b13028ab6716d33647b3e99388c" }
 # hyper-proxy2's unreleased rustls 0.23 update plus our upstream provider
 # compatibility fix. Drop this fork when a release includes both changes.
 hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca4811371ddae81c06be168de54194938d70b1" }
@@ -220,10 +220,10 @@ hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca48113
 # fallback, plus an in-memory credential cache for platform storage.
 # Every librespot crate comes from the
 # fork so one copy exists. Drop patches as upstream takes them.
-librespot-audio = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-connect = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-core = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-metadata = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-oauth = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-playback = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
-librespot-protocol = { git = "https://github.com/crmne/librespot", branch = "fastpotify-0.8" }
+librespot-audio = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
+librespot-connect = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
+librespot-core = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
+librespot-metadata = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
+librespot-oauth = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
+librespot-playback = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
+librespot-protocol = { git = "https://github.com/crmne/librespot", rev = "34ed484cb54f1217d1347a271eb299bb63444b75" }
