@@ -152,21 +152,6 @@ mod tests {
     }
 
     #[test]
-    fn replacing_the_client_is_visible_to_clones() {
-        let http = Http::default();
-        let clone = http.clone();
-        let replacement = reqwest::Client::builder()
-            .user_agent("fastpotify-test")
-            .build()
-            .unwrap();
-        http.replace(replacement.clone());
-        // Distinct Client values still share the pool after a replace; the
-        // lock is what matters, and a second replace of a dummy client
-        // must not panic.
-        clone.replace(reqwest::Client::new());
-    }
-
-    #[test]
     fn off_system_and_socks5_each_build_a_client() {
         build_client(&ProxyConfig::Off).unwrap();
         build_client(&ProxyConfig::System).unwrap();

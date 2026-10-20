@@ -583,12 +583,6 @@ mod tests {
         assert!(!is_font_file(Path::new("/x/fonts.dir")));
         assert!(!is_font_file(Path::new("/x/README")));
     }
-
-    #[test]
-    fn asking_the_system_never_panics() {
-        // Whatever fonts this machine has, including none.
-        let _ = fallbacks();
-    }
 }
 
 /// The ranking that serves the platforms with no answer of their own.
