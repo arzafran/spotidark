@@ -19,6 +19,8 @@ use sha1::{Digest, Sha1};
 const API: &str = "https://lrclib.net/api";
 /// Lyrics do not change; a cached answer is good for this long.
 const CACHE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// The lyrics cache is trimmed, oldest first, to this many bytes.
+const CACHE_CAP: u64 = 32 * 1024 * 1024;
 /// A candidate this far from the playing track's length is another
 /// recording, however well the names match.
 const MAX_DRIFT_SECS: f64 = 30.0;
@@ -602,7 +604,27 @@ fn write_cache(path: &Path, found: &Option<Lyrics>) {
     if let Ok(text) = serde_json::to_string(&Cached {
         found: found.clone(),
     }) {
-        let _ = std::fs::write(path, text);
+        // Two lookups of one song can finish together; each writes its own
+        // temporary so neither renames the other's half-written file.
+        static WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let write = WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = path.with_extension(format!("part-{}-{write}", std::process::id()));
+        let _ = crate::util::write_replacing(&temporary, path, text.as_bytes());
+    }
+}
+
+/// Deletes the least recently written lyrics until the cache fits its cap.
+/// Blocking; run it off the UI thread, once at startup.
+pub fn trim_cache(cache_dir: &Path) {
+    trim_cache_to(cache_dir, CACHE_CAP);
+}
+
+fn trim_cache_to(cache_dir: &Path, cap: u64) {
+    match crate::util::trim_dir_to(cache_dir, cap) {
+        Ok(0) => {}
+        Ok(freed) => log::info!("trimmed {freed} bytes from the lyrics cache"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => log::warn!("could not trim the lyrics cache: {error}"),
     }
 }
 
@@ -743,5 +765,45 @@ mod tests {
         assert_eq!(plain.lines.len(), 1);
         let nothing = Record::default();
         assert!(nothing.lyrics().is_none());
+    }
+
+    #[test]
+    fn cached_lyrics_are_written_whole_and_the_cache_is_trimmed_oldest_first() {
+        let dir =
+            std::env::temp_dir().join(format!("spotidark-lyrics-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let found = Some(Lyrics {
+            lines: vec![Line {
+                at_ms: Some(1_000),
+                text: "words".into(),
+            }],
+            synced: true,
+            instrumental: false,
+        });
+        let older = dir.join("older.json");
+        let newer = dir.join("newer.json");
+        write_cache(&older, &found);
+        write_cache(&newer, &None);
+        assert_eq!(read_cache(&older), Some(found.clone()));
+        assert_eq!(read_cache(&newer), Some(None));
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "no temporary is left behind: {names:?}");
+
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+        let newer_len = std::fs::metadata(&newer).unwrap().len();
+        trim_cache_to(&dir, newer_len);
+        assert!(!older.exists(), "the oldest answer goes first");
+        assert!(newer.exists());
+        trim_cache(&dir.join("absent"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

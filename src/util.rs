@@ -308,6 +308,58 @@ pub(crate) fn replace_file(
     }
 }
 
+/// Writes `contents` to `temporary`, then replaces `path` with it, so a
+/// reader sees either the old file or the whole new one. The temporary is
+/// removed if either step fails.
+pub(crate) fn write_replacing(
+    temporary: &std::path::Path,
+    path: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    let written = std::fs::write(temporary, contents).and_then(|()| replace_file(temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    written
+}
+
+/// Deletes the least recently written files directly inside `dir` until the
+/// rest fit in `cap` bytes, and returns how many bytes it freed.
+/// Subdirectories are left alone; a file that cannot be removed is skipped.
+pub(crate) fn trim_dir_to(dir: &std::path::Path, cap: u64) -> std::io::Result<u64> {
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        total = total.saturating_add(metadata.len());
+        files.push((modified, metadata.len(), entry.path()));
+    }
+    if total <= cap {
+        return Ok(0);
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    let mut freed = 0;
+    for (_, len, path) in files {
+        if total <= cap {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+            freed += len;
+        }
+    }
+    Ok(freed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +446,80 @@ mod tests {
             "Hi there & you"
         );
         assert_eq!(strip_html("ONE&#x2F;TWO&#x2F;THREE"), "ONE/TWO/THREE");
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("spotidark-util-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn replacing_a_file_swaps_in_the_new_contents() {
+        let dir = scratch("replace");
+        let path = dir.join("settings.json");
+        let temporary = dir.join("settings.json.tmp");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::write(&temporary, "new").unwrap();
+        replace_file(&temporary, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(!temporary.exists(), "the temporary is moved, not copied");
+
+        write_replacing(&temporary, &path, b"newer").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
+        assert!(!temporary.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_replacing_write_keeps_the_old_file_and_no_temporary() {
+        let dir = scratch("replace-fail");
+        let path = dir.join("history.json");
+        std::fs::write(&path, "old").unwrap();
+        // A directory where the temporary should go makes the write fail.
+        let temporary = dir.join("history.json.tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        assert!(write_replacing(&temporary, &path, b"new").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trimming_deletes_the_oldest_files_until_the_rest_fit() {
+        let dir = scratch("trim");
+        let now = std::time::SystemTime::now();
+        for (index, name) in ["oldest", "older", "newer", "newest"].iter().enumerate() {
+            let path = dir.join(name);
+            std::fs::write(&path, [0u8; 100]).unwrap();
+            let age = std::time::Duration::from_secs(3600 * (4 - index as u64));
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        std::fs::create_dir(dir.join("nested")).unwrap();
+
+        assert_eq!(trim_dir_to(&dir, 400).unwrap(), 0, "already fits");
+        assert_eq!(trim_dir_to(&dir, 250).unwrap(), 200);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["nested", "newer", "newest"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trimming_a_missing_directory_is_an_error_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotidark-util-trim-missing-{}",
+            std::process::id()
+        ));
+        assert!(trim_dir_to(&dir, 0).is_err());
     }
 }

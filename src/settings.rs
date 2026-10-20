@@ -526,6 +526,11 @@ impl Settings {
             Ok(text) => {
                 let mut settings = serde_json::from_str(&text).unwrap_or_else(|error| {
                     log::warn!("settings at {} are unreadable: {error}", path.display());
+                    // Keep the user's file: the next save writes the defaults.
+                    let kept = path.with_extension("json.bad");
+                    if let Err(error) = crate::util::replace_file(path, &kept) {
+                        log::warn!("unable to keep the unreadable settings: {error}");
+                    }
                     Self::default()
                 });
                 settings.migrate_proxy(&text);
@@ -1010,44 +1015,50 @@ mod tests {
     }
 
     #[test]
-    fn a_chosen_skin_round_trips() {
-        let settings = Settings {
-            winamp_window: true,
-            skin: Some("Zaxon.wsz".into()),
-            skin_scale: Some(3),
-            ..Settings::default()
-        };
-        let json = serde_json::to_string(&settings).unwrap();
-        let restored: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, settings);
-    }
-
-    #[test]
-    fn hidden_sidebar_round_trips() {
-        let settings = Settings {
-            sidebar_visible: false,
-            ..Settings::default()
-        };
-        let json = serde_json::to_string(&settings).unwrap();
-        let restored: Settings = serde_json::from_str(&json).unwrap();
-        assert!(!restored.sidebar_visible);
+    fn single_preferences_round_trip() {
+        let cases = [
+            (
+                "a chosen skin",
+                Settings {
+                    winamp_window: true,
+                    skin: Some("Zaxon.wsz".into()),
+                    skin_scale: Some(3),
+                    ..Settings::default()
+                },
+            ),
+            (
+                "a hidden sidebar",
+                Settings {
+                    sidebar_visible: false,
+                    ..Settings::default()
+                },
+            ),
+            (
+                "a compact sidebar",
+                Settings {
+                    sidebar_compact: true,
+                    ..Settings::default()
+                },
+            ),
+            (
+                "a compact track list",
+                Settings {
+                    tracklist_compact: true,
+                    ..Settings::default()
+                },
+            ),
+        ];
+        for (name, settings) in cases {
+            let json = serde_json::to_string(&settings).unwrap();
+            let restored: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, settings, "{name} did not survive a save");
+        }
     }
 
     #[test]
     fn older_settings_default_to_standard_sidebar() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(!settings.sidebar_compact);
-    }
-
-    #[test]
-    fn compact_sidebar_round_trips() {
-        let settings = Settings {
-            sidebar_compact: true,
-            ..Settings::default()
-        };
-        let json = serde_json::to_string(&settings).unwrap();
-        let restored: Settings = serde_json::from_str(&json).unwrap();
-        assert!(restored.sidebar_compact);
     }
 
     #[test]
@@ -1072,17 +1083,6 @@ mod tests {
         assert_eq!(restored.motion, super::MotionPreference::Reduced);
         assert!(restored.motion.reduced(false));
         assert!(!super::MotionPreference::Full.reduced(true));
-    }
-
-    #[test]
-    fn compact_tracklist_round_trips() {
-        let settings = Settings {
-            tracklist_compact: true,
-            ..Settings::default()
-        };
-        let json = serde_json::to_string(&settings).unwrap();
-        let restored: Settings = serde_json::from_str(&json).unwrap();
-        assert!(restored.tracklist_compact);
     }
 
     #[test]
@@ -1212,6 +1212,98 @@ mod tests {
         assert_eq!(manual.redacted().port(), Some(1080));
         assert!(manual.redacted().username().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("spotidark-settings-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn unreadable_settings_are_kept_aside_and_never_overwritten() {
+        let dir = scratch("corrupt");
+        let path = dir.join("settings.json");
+        let corrupt = r#"{"volume": 37, "theme": "light""#;
+        std::fs::write(&path, corrupt).unwrap();
+        let settings = Settings::load(&path);
+        assert_eq!(settings, Settings::default());
+        let bad = path.with_extension("json.bad");
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), corrupt);
+
+        settings.save(&path);
+        assert_eq!(Settings::load(&path), settings);
+        assert_eq!(
+            std::fs::read_to_string(&bad).unwrap(),
+            corrupt,
+            "saving does not touch the kept copy"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_settings_load_defaults_without_a_bad_copy() {
+        let dir = scratch("missing");
+        let path = dir.join("settings.json");
+        assert_eq!(Settings::load(&path), Settings::default());
+        assert!(!path.with_extension("json.bad").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_are_saved_through_a_temporary_that_is_then_replaced() {
+        let dir = scratch("atomic");
+        let path = dir.join("settings.json");
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&path, r#"{"volume":1}"#).unwrap();
+        // A temporary left by an interrupted save is replaced, not appended to.
+        std::fs::write(&temporary, "stale partial write").unwrap();
+        let settings = Settings {
+            volume: 37,
+            ..Settings::default()
+        };
+        settings.save(&path);
+        assert!(!temporary.exists(), "the temporary was renamed into place");
+        assert_eq!(Settings::load(&path), settings);
+
+        // When the temporary cannot be written, the existing file is untouched.
+        std::fs::create_dir(&temporary).unwrap();
+        Settings::default().save(&path);
+        assert_eq!(Settings::load(&path).volume, 37);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_legacy_http_url_becomes_http_mode() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"proxy":"http://user@127.0.0.1:8080"}"#).unwrap();
+        settings.migrate_proxy(r#"{"proxy":"http://user@127.0.0.1:8080"}"#);
+        assert_eq!(settings.proxy_mode, super::ProxyMode::Http);
+        assert_eq!(settings.proxy_host, "127.0.0.1");
+        assert_eq!(settings.proxy_port, "8080");
+        let super::ProxyConfig::Http(manual) = settings.proxy_config().unwrap() else {
+            panic!("expected an HTTP proxy");
+        };
+        assert_eq!(manual.redacted().as_str(), "http://127.0.0.1:8080/");
+
+        // A saved mode wins over the legacy URL's scheme.
+        let text = r#"{"proxy":"http://127.0.0.1:8080","proxy_mode":"off"}"#;
+        let mut chosen: Settings = serde_json::from_str(text).unwrap();
+        chosen.migrate_proxy(text);
+        assert_eq!(chosen.proxy_mode, super::ProxyMode::Off);
+    }
+
+    #[test]
+    fn a_malformed_legacy_proxy_migrates_without_panicking_and_is_rejected() {
+        for legacy in ["http://", "garbage", "http://:8080", "socks5://[::1"] {
+            let text = format!(r#"{{"proxy":{}}}"#, serde_json::to_string(legacy).unwrap());
+            let mut settings: Settings = serde_json::from_str(&text).unwrap();
+            settings.migrate_proxy(&text);
+            assert_ne!(settings.proxy_mode, super::ProxyMode::System, "{legacy}");
+            assert!(settings.proxy_config().is_err(), "{legacy} was accepted");
+        }
     }
 
     #[test]

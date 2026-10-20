@@ -50,9 +50,17 @@ struct Cli {
     #[arg(long)]
     demo_page: Option<String>,
 
-    /// Extra demo surfaces: a comma-separated list of `queue`, `playing-next`,
-    /// `devices`, `shortcuts`, `create`, `light`, `focus`, `update`, `personal-app`,
-    /// `personal-app-invalid`, `windows-taskbar`, `german`, `lyrics`, `lyrics-fullscreen`.
+    /// Extra demo surfaces, comma-separated. Panels: `queue`, `playing-next`,
+    /// `queue-empty`, `queue-loading`, `queue-error`, `recents`,
+    /// `recents-empty`, `recents-loading`, `recents-error`, `devices`,
+    /// `many-devices`, `lyrics`, `lyrics-fullscreen`, `lyrics-follow`,
+    /// `lyrics-empty`, `lyrics-loading`, `lyrics-error`, `lyrics-instrumental`,
+    /// `lyrics-no-playback`. Dialogs: `shortcuts`, `premium`, `edit`, `create`,
+    /// `duplicate`, `update`, `personal-app`, `personal-app-invalid`. Library:
+    /// `finite-playlist`, `folders`, `pins`, `sorted`, `resume`, `resume-next`.
+    /// Window: `light`, `focus`, `compact`, `art`, `german`, `scripts`,
+    /// `faster`, `windows-taskbar`. Mini player: `winamp`, `playlist`, `shade`,
+    /// `playlist-shade`, `eq`, `eq-shade`, `presets`, `small`, `milkdrop`.
     #[cfg(feature = "demo")]
     #[arg(long)]
     demo_show: Option<String>,
@@ -755,10 +763,6 @@ impl MiniWindow {
     }
 }
 
-const fn main_window_decorated(on_windows: bool) -> bool {
-    !on_windows
-}
-
 #[cfg(any(test, feature = "demo"))]
 fn parse_demo_size(spec: &str) -> Result<[f32; 2], String> {
     let (width, height) = spec
@@ -853,7 +857,7 @@ fn native_options(
                 .with_title_shown(false)
                 // Windows has no equivalent to macOS's floating traffic lights.
                 // Removing its decorations lets the app surface fill the window.
-                .with_decorations(main_window_decorated(cfg!(windows)))
+                .with_decorations(!cfg!(windows))
                 .with_inner_size(size)
                 .with_min_inner_size(inner_size.unwrap_or([760.0, 520.0]))
                 .with_fullscreen(fullscreen);
@@ -1063,12 +1067,6 @@ mod native_window_tests {
             };
             assert!(!eframe::App::persist_egui_memory(&shell));
         }
-    }
-
-    #[test]
-    fn only_windows_removes_the_native_frame() {
-        assert!(!main_window_decorated(true));
-        assert!(main_window_decorated(false));
     }
 }
 
