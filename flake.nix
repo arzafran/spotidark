@@ -186,6 +186,10 @@
                   $out/share/spotifast/omarchy/spotifast.json.tpl
                 install -Dm755 contrib/omarchy/spotifast-theme \
                   $out/share/spotifast/omarchy/spotifast-theme
+                install -Dm644 contrib/omarchy/spotidark.json.tpl \
+                  $out/share/spotidark/omarchy/spotidark.json.tpl
+                install -Dm755 contrib/omarchy/spotidark-theme \
+                  $out/share/spotidark/omarchy/spotidark-theme
               '';
 
               meta = {
