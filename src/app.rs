@@ -51,6 +51,11 @@ const ASSUMED_CONTEXT_HOLD: Duration = Duration::from_secs(8);
 /// has not caught up yet. Spotify can take a moment to report a command it
 /// has already carried out.
 const PLAYBACK_HOLD: Duration = Duration::from_secs(6);
+/// How long a playlist edit or unfollow Spotify accepted stays on show
+/// over reads that still tell the story from before it. A read that agrees
+/// ends the hold sooner; the limit stops a value Spotify stored differently
+/// from being masked for good.
+const CONFIRMED_PLAYLIST_HOLD: Duration = Duration::from_secs(30);
 /// Delay before checking playback again after a command.
 const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
 /// Delay before checking the queue after a local change.
@@ -4008,16 +4013,36 @@ impl App {
         }
     }
 
-    /// Keeps edits and unfollows Spotify has not confirmed over a fetched
-    /// playlist list.
-    fn hold_playlist_changes(&self, playlists: &mut Vec<Playlist>) {
-        let library = &self.library;
+    /// Keeps edits and unfollows Spotify's reads have not caught up with
+    /// over a fetched playlist list. A `complete` list lacking an unfollowed
+    /// playlist, or a read showing an edit, ends that hold.
+    fn hold_playlist_changes(&mut self, playlists: &mut Vec<Playlist>, complete: bool) {
+        let library = &mut self.library;
+        let lapsed = |confirmed: Option<Instant>| {
+            confirmed.is_some_and(|at| at.elapsed() >= CONFIRMED_PLAYLIST_HOLD)
+        };
+        library.removed_playlists.retain(|id, removed| {
+            let caught_up = removed.confirmed.is_some()
+                && complete
+                && !playlists.iter().any(|playlist| &playlist.id == id);
+            !caught_up && !lapsed(removed.confirmed)
+        });
         playlists.retain(|playlist| !library.removed_playlists.contains_key(&playlist.id));
-        for playlist in playlists {
-            if let Some(edit) = library.playlist_edits.get(&playlist.id) {
-                edit.after.apply(playlist);
+        library.playlist_edits.retain(|id, edit| {
+            let mut read = playlists
+                .iter_mut()
+                .filter(|playlist| &playlist.id == id)
+                .peekable();
+            let caught_up = edit.confirmed.is_some()
+                && read
+                    .peek()
+                    .is_some_and(|playlist| edit.after.shown_by(playlist));
+            if caught_up || lapsed(edit.confirmed) {
+                return false;
             }
-        }
+            read.for_each(|playlist| edit.after.apply(playlist));
+            true
+        });
     }
 
     /// Changes a playlist wherever it is on show: its library entry and its
@@ -4524,7 +4549,8 @@ impl App {
                     // A read can predate an edit or unfollow still in
                     // flight. A reload's pages wait for that until shown.
                     if matches!(self.library.playlists_refresh, PlaylistsRefresh::Idle) {
-                        self.hold_playlist_changes(&mut page.items);
+                        let complete = offset == 0 && next_offset.is_none();
+                        self.hold_playlist_changes(&mut page.items, complete);
                     }
                     match &mut self.library.playlists_refresh {
                         PlaylistsRefresh::Idle => match &mut self.library.playlists {
@@ -4550,7 +4576,7 @@ impl App {
                         && let PlaylistsRefresh::Receiving { mut playlists, .. } =
                             std::mem::take(&mut self.library.playlists_refresh)
                     {
-                        self.hold_playlist_changes(&mut playlists);
+                        self.hold_playlist_changes(&mut playlists, true);
                         self.library.playlists = Loadable::Loaded(playlists);
                     }
                     self.library.playlists_next = next_offset;
@@ -4652,7 +4678,14 @@ impl App {
                         playlist.fill_from(listed);
                     }
                     if let Some(edit) = self.library.playlist_edits.get(&id) {
-                        edit.after.apply(playlist);
+                        let ended = edit.confirmed.is_some_and(|at| {
+                            edit.after.shown_by(playlist) || at.elapsed() >= CONFIRMED_PLAYLIST_HOLD
+                        });
+                        if ended {
+                            self.library.playlist_edits.remove(&id);
+                        } else {
+                            edit.after.apply(playlist);
+                        }
                     }
                     if let Some(image) = pick_image(&playlist.images, 300) {
                         self.tint_for(Some(image));
@@ -4869,9 +4902,11 @@ impl App {
                 self.playlist_busy = false;
                 match result {
                     Ok(()) => {
-                        // The shown details are what Spotify now holds; a
-                        // read this soon could still tell the old ones.
-                        self.library.playlist_edits.remove(&id);
+                        // A read this soon could still tell the old details,
+                        // so the edit stays held until one agrees.
+                        if let Some(edit) = self.library.playlist_edits.get_mut(&id) {
+                            edit.confirmed = Some(Instant::now());
+                        }
                         self.toast("Playlist updated");
                     }
                     Err(error) => {
@@ -4971,7 +5006,11 @@ impl App {
                 result,
             } => match result {
                 Ok(()) => {
-                    self.library.removed_playlists.remove(&id);
+                    // The reload below could still list the playlist; it
+                    // stays off the list until a complete read agrees.
+                    if let Some(removed) = self.library.removed_playlists.get_mut(&id) {
+                        removed.confirmed = Some(Instant::now());
+                    }
                     self.saved
                         .insert(format!("spotify:playlist:{id}"), followed);
                     self.toast(if followed {
@@ -4988,11 +5027,11 @@ impl App {
                 Err(error) => {
                     self.saved
                         .insert(format!("spotify:playlist:{id}"), !followed);
-                    if let Some((position, playlist)) = self.library.removed_playlists.remove(&id)
+                    if let Some(removed) = self.library.removed_playlists.remove(&id)
                         && let Some(playlists) = self.library.playlists.get_mut()
                         && !playlists.iter().any(|listed| listed.id == id)
                     {
-                        playlists.insert(position.min(playlists.len()), playlist);
+                        playlists.insert(removed.position.min(playlists.len()), removed.playlist);
                     }
                     self.toast_error(format!("Couldn't update the playlist: {error}"));
                 }
@@ -7624,14 +7663,17 @@ impl App {
                         description: Some(description.clone()),
                         public,
                     };
-                    self.library
+                    let edit = self
+                        .library
                         .playlist_edits
                         .entry(id.clone())
                         .or_insert_with(|| PendingPlaylistEdit {
                             before,
                             after: after.clone(),
-                        })
-                        .after = after.clone();
+                            confirmed: None,
+                        });
+                    edit.after = after.clone();
+                    edit.confirmed = None;
                     self.show_playlist_details(&id, |playlist| after.apply(playlist));
                 }
                 self.backend.api(ApiRequest::UpdatePlaylist {
@@ -7649,9 +7691,14 @@ impl App {
                 {
                     let removed = playlists.remove(position);
                     playlists.retain(|playlist| playlist.id != id);
-                    self.library
-                        .removed_playlists
-                        .insert(id.clone(), (position, removed));
+                    self.library.removed_playlists.insert(
+                        id.clone(),
+                        RemovedPlaylist {
+                            position,
+                            playlist: removed,
+                            confirmed: None,
+                        },
+                    );
                 }
                 self.backend
                     .api(ApiRequest::FollowPlaylist { id, follow: false });
@@ -11168,7 +11215,104 @@ mod tests {
             app.playlist_pages.contains_key(&id),
             "the loaded page stays"
         );
+
+        // Spotify accepted it, but its reads lag behind the write.
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![old.clone()],
+                ..Default::default()
+            }),
+        });
+        app.handle_api(ApiResponse::Playlist {
+            id: id.clone(),
+            generation: app.playlist_pages[&id].generation,
+            result: Ok(old.clone()),
+        });
+        assert_eq!(
+            shown(&app),
+            renamed,
+            "a lagging read after success does not undo it"
+        );
+
+        // A read that shows the edit ends the hold.
+        let mut caught_up = old.clone();
+        renamed.apply(&mut caught_up);
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![caught_up],
+                ..Default::default()
+            }),
+        });
         assert!(app.library.playlist_edits.is_empty());
+        assert_eq!(shown(&app), renamed);
+    }
+
+    /// An accepted edit Spotify never reads back stops being held after a
+    /// while, so a name it stored differently is not masked for good.
+    #[test]
+    fn an_accepted_edit_is_held_only_for_a_while() {
+        let mut app = headless_app();
+        let mut stored = listed_playlist("Stored");
+        let id = stored.id.clone();
+        app.library.playlist_edits.insert(
+            id.clone(),
+            PendingPlaylistEdit {
+                before: PlaylistDetails::of(&stored),
+                after: PlaylistDetails {
+                    name: "Typed ".into(),
+                    description: None,
+                    public: None,
+                },
+                confirmed: Some(Instant::now() - CONFIRMED_PLAYLIST_HOLD),
+            },
+        );
+        stored.name = "Typed".into();
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(crate::api::models::Page {
+                items: vec![stored],
+                ..Default::default()
+            }),
+        });
+        assert!(app.library.playlist_edits.is_empty());
+        assert_eq!(app.library.playlists.get().unwrap()[0].name, "Typed");
+    }
+
+    /// An accepted unfollow keeps the playlist off the list while Spotify's
+    /// reads still include it, until a complete list leaves it out.
+    #[test]
+    fn an_accepted_unfollow_is_not_undone_by_a_lagging_read() {
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.library.playlists = Loadable::Loaded(vec![
+            listed_playlist("a"),
+            listed_playlist("b"),
+            listed_playlist("c"),
+        ]);
+        app.apply(Action::DeletePlaylist("b".into()), &ctx);
+        app.handle_api(ApiResponse::PlaylistFollowChanged {
+            id: "b".into(),
+            followed: false,
+            result: Ok(()),
+        });
+        // The reload the success started reads from before the unfollow.
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(playlists_page(0, &["a", "b", "c"], false)),
+        });
+        assert_eq!(listed_ids(&app), Some(vec!["a".into(), "c".into()]));
+        assert_ne!(app.saved.get("spotify:playlist:b"), Some(&true));
+
+        // A complete list without it ends the hold.
+        app.load_playlists();
+        app.handle_api(ApiResponse::MyPlaylists {
+            offset: 0,
+            result: Ok(playlists_page(0, &["a", "c"], false)),
+        });
+        assert!(app.library.removed_playlists.is_empty());
+        assert_eq!(listed_ids(&app), Some(vec!["a".into(), "c".into()]));
     }
 
     /// A failed unfollow puts the playlist back where it was in the list.

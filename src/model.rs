@@ -552,13 +552,35 @@ impl PlaylistDetails {
         self.apply(playlist);
         playlist.public = self.public;
     }
+
+    /// Whether a read shows these details. Spotify reports an empty
+    /// description as none, and an unknown public flag asks nothing.
+    pub fn shown_by(&self, playlist: &Playlist) -> bool {
+        let description = |value: &Option<String>| value.clone().unwrap_or_default();
+        playlist.name == self.name
+            && description(&playlist.description) == description(&self.description)
+            && (self.public.is_none() || playlist.public == self.public)
+    }
 }
 
-/// An edit shown before Spotify confirmed it.
+/// An edit shown before Spotify's reads caught up with it.
 #[derive(Clone, Debug)]
 pub struct PendingPlaylistEdit {
     pub before: PlaylistDetails,
     pub after: PlaylistDetails,
+    /// When Spotify accepted the write; reads may still tell the old
+    /// details for a while after it.
+    pub confirmed: Option<Instant>,
+}
+
+/// A playlist taken off the list before Spotify's reads caught up with the
+/// unfollow.
+#[derive(Clone, Debug)]
+pub struct RemovedPlaylist {
+    pub position: usize,
+    pub playlist: Playlist,
+    /// When Spotify accepted the unfollow.
+    pub confirmed: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -566,11 +588,11 @@ pub struct Library {
     pub playlists: Loadable<Vec<Playlist>>,
     pub playlists_next: Option<u32>,
     pub playlists_refresh: PlaylistsRefresh,
-    /// Edits shown before Spotify confirmed them, by playlist ID.
+    /// Edits shown before Spotify's reads caught up, by playlist ID.
     pub playlist_edits: HashMap<String, PendingPlaylistEdit>,
-    /// Playlists removed from the list before Spotify confirmed the
-    /// unfollow, with their position, so a failure can put them back.
-    pub removed_playlists: HashMap<String, (usize, Playlist)>,
+    /// Playlists removed from the list before Spotify's reads caught up
+    /// with the unfollow, so a failure can put them back where they were.
+    pub removed_playlists: HashMap<String, RemovedPlaylist>,
     pub liked: PagedList<Arc<SavedTrack>>,
     pub albums: PagedList<SavedAlbum>,
     pub artists: CursorList<Artist>,
