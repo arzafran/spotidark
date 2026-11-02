@@ -99,8 +99,9 @@ pub struct Guard {
     /// Filled by control clients, drained by the app every frame. On Linux
     /// the same requests arrive through MPRIS instead and this stays empty.
     commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
+    #[cfg(not(target_os = "linux"))]
     /// Current-track snapshot for `nowplaying` requests.
-    now_playing: std::sync::Arc<std::sync::Mutex<String>>,
+    now_playing: std::sync::Arc<std::sync::Mutex<NowPlayingSnapshot>>,
     /// Last Spotify Connect device snapshot, as one line of JSON.
     devices: std::sync::Arc<std::sync::Mutex<String>>,
 }
@@ -111,8 +112,9 @@ impl Guard {
         std::sync::Arc::clone(&self.commands)
     }
 
+    #[cfg(not(target_os = "linux"))]
     /// The slot the app writes the now-playing snapshot into.
-    pub fn now_playing_slot(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
+    pub(crate) fn now_playing_slot(&self) -> std::sync::Arc<std::sync::Mutex<NowPlayingSnapshot>> {
         std::sync::Arc::clone(&self.now_playing)
     }
 
@@ -124,6 +126,82 @@ impl Guard {
 
 /// Snapshot value reported when nothing is playing.
 pub const NOTHING_PLAYING: &str = "stopped";
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+pub(crate) struct NowPlayingSnapshot {
+    line: String,
+    position: Option<TimedPosition>,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+struct TimedPosition {
+    field: std::ops::Range<usize>,
+    position_ms: u32,
+    duration_ms: u32,
+    sampled_at: std::time::Instant,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Default for NowPlayingSnapshot {
+    fn default() -> Self {
+        Self {
+            line: NOTHING_PLAYING.to_owned(),
+            position: None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl NowPlayingSnapshot {
+    pub(crate) fn new(
+        line: String,
+        playing: bool,
+        position_ms: u32,
+        duration_ms: u32,
+        sampled_at: std::time::Instant,
+    ) -> Self {
+        let mut tabs = line.match_indices('\t').map(|(at, _)| at);
+        let field = tabs
+            .nth(3)
+            .and_then(|before| tabs.next().map(|after| before + 1..after));
+        Self {
+            line,
+            position: playing
+                .then_some(field)
+                .flatten()
+                .map(|field| TimedPosition {
+                    field,
+                    position_ms,
+                    duration_ms,
+                    sampled_at,
+                }),
+        }
+    }
+
+    pub(crate) fn line_at(&self, now: std::time::Instant) -> String {
+        let Some(position) = &self.position else {
+            return self.line.clone();
+        };
+        if position.field.is_empty() {
+            return self.line.clone();
+        }
+        let elapsed = now
+            .saturating_duration_since(position.sampled_at)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        let current = position
+            .position_ms
+            .saturating_add(elapsed)
+            .min(position.duration_ms);
+        let mut line = String::with_capacity(self.line.len() + 10);
+        line.push_str(&self.line[..position.field.start]);
+        line.push_str(&current.to_string());
+        line.push_str(&self.line[position.field.end..]);
+        line
+    }
+}
 
 /// Device snapshot used before loading and when Spotify reports no devices.
 pub const NO_DEVICES: &str = "[]";
@@ -203,7 +281,7 @@ pub fn acquire(waker: &crate::backend::Waker, link: Option<&str>) -> Outcome {
 
     let unguarded = || Guard {
         commands: Default::default(),
-        now_playing: Arc::new(Mutex::new(NOTHING_PLAYING.to_owned())),
+        now_playing: Arc::new(Mutex::new(NowPlayingSnapshot::default())),
         devices: Arc::new(Mutex::new(NO_DEVICES.to_owned())),
     };
 
@@ -249,7 +327,7 @@ pub fn acquire(waker: &crate::backend::Waker, link: Option<&str>) -> Outcome {
 fn serve(
     listener: std::net::TcpListener,
     commands: &std::sync::Mutex<Vec<ControlCommand>>,
-    now_playing: &std::sync::Mutex<String>,
+    now_playing: &std::sync::Mutex<NowPlayingSnapshot>,
     devices: &std::sync::Mutex<String>,
     waker: &crate::backend::Waker,
 ) {
@@ -278,7 +356,7 @@ fn serve(
                 let snapshot = now_playing
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                    .line_at(std::time::Instant::now());
                 let _ = stream.write_all(format!("{NOW_REPLY}{snapshot}\n").as_bytes());
             }
             Some(Request::Devices) => {
@@ -462,7 +540,6 @@ pub fn acquire(waker: &crate::backend::Waker, link: Option<&str>) -> Outcome {
     let guard = |connection: Option<Connection>| Guard {
         _connection: connection,
         commands: Default::default(),
-        now_playing: std::sync::Arc::new(std::sync::Mutex::new(NOTHING_PLAYING.to_owned())),
         devices: std::sync::Arc::new(std::sync::Mutex::new(NO_DEVICES.to_owned())),
     };
 
@@ -715,6 +792,86 @@ mod tests {
         }
     }
 
+    fn timed_snapshot(
+        state: &str,
+        position_ms: u32,
+        duration_ms: u32,
+        sampled_at: std::time::Instant,
+    ) -> NowPlayingSnapshot {
+        NowPlayingSnapshot::new(
+            format!(
+                "{state}\t東京の歌\tBjörk\tÁlbum\t{position_ms}\t{duration_ms}\t50\toff\toff\thttps://art.invalid/ä\tunknown\tKüche"
+            ),
+            state == "playing",
+            position_ms,
+            duration_ms,
+            sampled_at,
+        )
+    }
+
+    #[test]
+    fn now_playing_position_advances_caps_and_resets_from_new_samples() {
+        let sampled_at = std::time::Instant::now();
+        let playing = timed_snapshot("playing", 1_000, 5_000, sampled_at);
+        let original: Vec<_> = playing
+            .line_at(sampled_at)
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        let fields: Vec<_> = playing
+            .line_at(sampled_at + std::time::Duration::from_millis(750))
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(fields[4], "1750");
+        assert_eq!(fields.len(), 12);
+        for index in (0..fields.len()).filter(|index| *index != 4) {
+            assert_eq!(fields[index], original[index], "wire field {index} moved");
+        }
+        assert_eq!(
+            playing
+                .line_at(sampled_at + std::time::Duration::from_secs(20))
+                .split('\t')
+                .nth(4),
+            Some("5000")
+        );
+
+        let paused = timed_snapshot("paused", 2_000, 5_000, sampled_at);
+        assert_eq!(
+            paused
+                .line_at(sampled_at + std::time::Duration::from_secs(20))
+                .split('\t')
+                .nth(4),
+            Some("2000")
+        );
+        let seeked = timed_snapshot(
+            "playing",
+            400,
+            5_000,
+            sampled_at + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(
+            seeked
+                .line_at(sampled_at + std::time::Duration::from_millis(1_250))
+                .split('\t')
+                .nth(4),
+            Some("650")
+        );
+        let next_track = timed_snapshot(
+            "playing",
+            0,
+            8_000,
+            sampled_at + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(
+            next_track
+                .line_at(sampled_at + std::time::Duration::from_millis(2_100))
+                .split('\t')
+                .nth(4),
+            Some("100")
+        );
+    }
+
     #[test]
     fn parses_every_control_verb() {
         // #given / #when / #then
@@ -853,7 +1010,13 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
         let port = listener.local_addr().expect("a bound address").port();
         let commands: Arc<Mutex<Vec<ControlCommand>>> = Default::default();
-        let now_playing = Arc::new(Mutex::new("playing\tGo\tThe Band".to_owned()));
+        let now_playing = Arc::new(Mutex::new(NowPlayingSnapshot::new(
+            "playing\tGo\tThe Band".to_owned(),
+            false,
+            0,
+            0,
+            std::time::Instant::now(),
+        )));
         let devices = Arc::new(Mutex::new(
             r#"[{"id":"abc","name":"Kitchen","kind":"Speaker","active":true}]"#.to_owned(),
         ));

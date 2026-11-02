@@ -5638,7 +5638,11 @@ mod tests {
                             ui,
                             crate::ui::collection::Table {
                                 pagination: None,
-                                items: if empty { &[] } else { &row_refs },
+                                source: crate::ui::collection::TableSource::Rows(if empty {
+                                    &[]
+                                } else {
+                                    &row_refs
+                                }),
                                 row_offset: if mode == "empty" { 0 } else { 100 },
                                 context: crate::model::RowContext::Context {
                                     uri: "spotify:playlist:pl1".into(),

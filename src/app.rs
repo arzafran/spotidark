@@ -33,6 +33,9 @@ const REMOTE_POLL_IDLE: Duration = Duration::from_secs(20);
 const REMOTE_FRESH: Duration = Duration::from_secs(45);
 const DEVICES_FRESH: Duration = Duration::from_secs(12);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
+const QUEUE_FRESH: Duration = Duration::from_secs(20);
+const CACHE_MAINTENANCE: Duration = Duration::from_secs(20);
+const SAVE_DELAY: Duration = Duration::from_secs(2);
 /// How far into a song Previous restarts it rather than stepping back,
 /// matching what librespot does during playback.
 const RESTART_BEFORE_PREVIOUS: u32 = 3_000;
@@ -183,6 +186,7 @@ pub struct App {
     proxy_form_edited: bool,
     settings_dirty: bool,
     last_settings_save: Instant,
+    waker: Waker,
     pub backend: Backend,
     media_controls: Option<MediaService>,
     /// The artwork the media controls were last given, and the URL it came
@@ -202,8 +206,10 @@ pub struct App {
     /// a Raycast script), on the platforms where they do not arrive through
     /// MPRIS. Drained every frame.
     control_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>>,
+    #[cfg(not(target_os = "linux"))]
     /// Now-playing snapshot for the control channel.
-    control_now_playing: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    control_now_playing:
+        Option<std::sync::Arc<std::sync::Mutex<crate::single_instance::NowPlayingSnapshot>>>,
     /// The same, for its `devices` verb.
     control_devices: Option<std::sync::Arc<std::sync::Mutex<String>>>,
     /// Whether that device slot still matches [`Self::devices`]. The
@@ -578,6 +584,7 @@ impl App {
             proxy_form_edited: false,
             settings_dirty: false,
             last_settings_save: Instant::now(),
+            waker: waker.clone(),
             backend,
             media_controls,
             media_art: None,
@@ -587,6 +594,7 @@ impl App {
             wants_show: false,
             switch_intent: false,
             control_commands: None,
+            #[cfg(not(target_os = "linux"))]
             control_now_playing: None,
             control_devices: None,
             control_devices_stale: true,
@@ -775,16 +783,22 @@ impl App {
     /// read -- now playing, and the device list -- fresh.
     pub fn set_remote_control(&mut self, guard: &crate::single_instance::Guard) {
         self.control_commands = Some(guard.commands());
-        self.control_now_playing = Some(guard.now_playing_slot());
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.control_now_playing = Some(guard.now_playing_slot());
+        }
         self.control_devices = Some(guard.devices_slot());
     }
 
     /// Per-window setup: fonts, icons, loaders, theme. Called every time a
     /// window is (re)created around this long-lived application state.
     pub fn attach(&mut self, ctx: &egui::Context) {
+        self.backend.art().release_graphics();
+        self.lyrics_backdrop.release_graphics();
         theme::install(ctx);
         ctx.add_bytes_loader(std::sync::Arc::new(self.backend.art().clone()));
         ctx.add_image_loader(std::sync::Arc::new(self.backend.art().image_loader()));
+        ctx.add_texture_loader(std::sync::Arc::new(self.backend.art().texture_loader()));
         ctx.set_theme(self.theme_preference());
         self.applied_dark = None;
         self.winamp.forget_textures();
@@ -855,6 +869,8 @@ impl App {
         // The Winamp window went with it; it comes back where it was.
         self.winamp.remember_position();
         self.winamp.forget_textures();
+        self.backend.art().release_graphics();
+        self.lyrics_backdrop.release_graphics();
         self.window_hidden = true;
         self.hide_intent = false;
         self.wants_show = false;
@@ -2256,8 +2272,7 @@ impl App {
             .retain(|toast| toast.created.elapsed() < TOAST_LIFETIME);
         self.maybe_suggest_personal_app();
 
-        if self.settings.check_for_updates
-            && !self.offline
+        if self.automatic_update_check_eligible()
             && self
                 .last_update_check
                 .is_none_or(|at| at.elapsed() >= crate::updates::CHECK_INTERVAL)
@@ -2288,7 +2303,7 @@ impl App {
                 && !self.devices_loading
                 && self
                     .devices_fetched_at
-                    .is_none_or(|at| at.elapsed() > DEVICES_FRESH)
+                    .is_none_or(|at| at.elapsed() >= DEVICES_FRESH)
             {
                 self.refresh_devices();
             }
@@ -2297,7 +2312,7 @@ impl App {
                 && !self.queue.is_loading()
                 && self
                     .queue_fetched_at
-                    .is_none_or(|at| at.elapsed() > Duration::from_secs(20))
+                    .is_none_or(|at| at.elapsed() >= QUEUE_FRESH)
             {
                 self.refresh_queue(false);
             }
@@ -2334,30 +2349,40 @@ impl App {
             }
         }
 
-        if self.last_eviction.elapsed() > Duration::from_secs(20) {
+        if self.last_eviction.elapsed() >= CACHE_MAINTENANCE {
             self.last_eviction = now;
             self.backend.art().evict(ctx);
             self.evict_stale_pages();
         }
-        self.sync_skin(ctx);
-        if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
+        self.sync_skin();
+        if self.settings_dirty && self.last_settings_save.elapsed() >= SAVE_DELAY {
             self.save_settings();
         }
-        if self.session_dirty && self.last_session_save.elapsed() > Duration::from_secs(2) {
+        if self.session_dirty && self.last_session_save.elapsed() >= SAVE_DELAY {
             self.save_session();
         }
     }
 
+    fn automatic_update_check_eligible(&self) -> bool {
+        self.settings.check_for_updates
+            && !self.offline
+            && !self.update_checking
+            && matches!(
+                self.update_download,
+                crate::updates::DownloadState::Idle | crate::updates::DownloadState::Failed(_)
+            )
+    }
+
     /// Loads and applies the skin selected in settings.
     /// On failure, restores the active skin setting to avoid repeated retries.
-    fn sync_skin(&mut self, ctx: &egui::Context) {
+    fn sync_skin(&mut self) {
         if self.settings.winamp_window
             && !self.winamp.is_loading()
             && self.winamp.worn != self.settings.skin
         {
             match self.settings.skin.clone() {
                 None => self.winamp.wear(None, crate::skin::Skin::builtin()),
-                Some(name) => self.winamp.load(name, &self.dirs.skins_dir(), ctx),
+                Some(name) => self.winamp.load(name, &self.dirs.skins_dir(), &self.waker),
             }
         }
         if let Some(loaded) = self.winamp.poll() {
@@ -2383,7 +2408,7 @@ impl App {
 
     /// Syncs MilkDrop settings and receives window state and commands.
     #[cfg(feature = "milkdrop")]
-    fn sync_milkdrop(&mut self, ctx: &egui::Context) {
+    fn sync_milkdrop(&mut self) {
         let presets = self.dirs.milkdrop_dir();
         let open = self.settings.milkdrop_open;
         let size = self.settings.milkdrop_size;
@@ -2403,7 +2428,7 @@ impl App {
         });
         if self.milkdrop_host.is_none() {
             let tap = std::sync::Arc::clone(&self.winamp.tap);
-            self.milkdrop_host = Some(crate::milkdrop::host::Host::new(tap));
+            self.milkdrop_host = Some(crate::milkdrop::host::Host::new(tap, self.waker.clone()));
         }
         let poll = {
             let host = self.milkdrop_host.as_mut().expect("the host was just made");
@@ -2437,10 +2462,6 @@ impl App {
         if let Some(hz) = poll.screen_hz {
             self.learn_screen_hz(hz);
         }
-        // Poll the child while the main window is otherwise idle.
-        if self.settings.milkdrop_open {
-            ctx.request_repaint_after(std::time::Duration::from_millis(300));
-        }
     }
 
     /// Records the MilkDrop screen refresh rate and uses it as the initial FPS.
@@ -2455,6 +2476,9 @@ impl App {
         self.settings.milkdrop_screen_hz = hz;
         if first {
             self.settings.milkdrop_fps = hz;
+            // `host.update` already ran in this background frame. Schedule
+            // one more pass so the child receives the adopted rate now.
+            self.waker.wake();
         }
         self.mark_settings_dirty();
     }
@@ -2901,8 +2925,9 @@ impl App {
         if let Some(tray) = &mut self.tray {
             tray.set_playing(playing);
         }
+        #[cfg(not(target_os = "linux"))]
         if let Some(slot) = &self.control_now_playing {
-            let snapshot = self.control_snapshot();
+            let snapshot = self.timed_control_snapshot(Instant::now());
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
         }
         if self.control_devices_stale
@@ -2923,8 +2948,15 @@ impl App {
     /// not: something to draw, whether the heart is filled, and where the
     /// sound is coming out. They are appended rather than woven in, so a
     /// script written against the older nine fields still reads correctly.
+    #[cfg(test)]
     fn control_snapshot(&self) -> String {
-        let Some(now) = self.now_playing() else {
+        let now = self.now_playing();
+        self.control_snapshot_for(now.as_ref())
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    fn control_snapshot_for(&self, now: Option<&NowPlaying>) -> String {
+        let Some(now) = now else {
             return crate::single_instance::NOTHING_PLAYING.to_owned();
         };
         let state = if now.playing { "playing" } else { "paused" };
@@ -2965,6 +2997,25 @@ impl App {
             clean(now.art_url.as_deref().unwrap_or_default()),
             clean(device),
         )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn timed_control_snapshot(
+        &self,
+        sampled_at: Instant,
+    ) -> crate::single_instance::NowPlayingSnapshot {
+        let now = self.now_playing();
+        let line = self.control_snapshot_for(now.as_ref());
+        match now {
+            Some(now) => crate::single_instance::NowPlayingSnapshot::new(
+                line,
+                now.playing,
+                now.position_ms,
+                now.duration_ms,
+                sampled_at,
+            ),
+            None => crate::single_instance::NowPlayingSnapshot::default(),
+        }
     }
 
     /// Last Spotify Connect device list as one JSON line.
@@ -7828,8 +7879,7 @@ impl App {
                 }
             }
             Action::ReloadThemes => {
-                let waker = Waker::default();
-                waker.attach(ctx);
+                let waker = self.waker.clone();
                 self.load_custom_themes(&waker);
             }
             Action::OpenThemesFolder => {
@@ -7939,7 +7989,8 @@ impl App {
                 self.settings_dirty = true;
             }
             Action::InstallSkin(path) => {
-                self.winamp.install(path, &self.dirs.skins_dir(), ctx);
+                self.winamp
+                    .install(path, &self.dirs.skins_dir(), &self.waker);
             }
             Action::SetSkinScale(scale) => {
                 self.settings.skin_scale = Some(scale);
@@ -8045,6 +8096,9 @@ impl App {
             Action::ToggleWinampMilkdrop => {
                 self.settings.milkdrop_open = !self.settings.milkdrop_open;
                 self.settings_dirty = true;
+                // MilkDrop sync precedes UI actions, so publish the changed
+                // open state in a follow-up frame without periodic polling.
+                self.waker.wake();
                 #[cfg(feature = "milkdrop")]
                 if self.settings.milkdrop_open {
                     // A first open has nothing to draw but the idle preset,
@@ -8057,7 +8111,7 @@ impl App {
                     {
                         self.winamp.presets.download_missing(
                             folder,
-                            ctx.clone(),
+                            self.waker.clone(),
                             self.applied_proxy.clone(),
                         );
                         self.toast("Downloading MilkDrop preset packs");
@@ -8067,6 +8121,7 @@ impl App {
             Action::SetMilkdropSeconds(seconds) => {
                 self.settings.milkdrop_seconds = seconds.clamp(1, 3600);
                 self.settings_dirty = true;
+                self.waker.wake();
             }
             Action::SetMilkdropFps(fps) => {
                 self.settings.milkdrop_fps = if fps == 0 {
@@ -8078,10 +8133,12 @@ impl App {
                     )
                 };
                 self.settings_dirty = true;
+                self.waker.wake();
             }
             Action::SetMilkdropScale(scale) => {
                 self.settings.milkdrop_scale = scale.clamp(1, 4);
                 self.settings_dirty = true;
+                self.waker.wake();
             }
             Action::OpenMilkdropFolder => self.open_folder(self.dirs.milkdrop_dir()),
             Action::DownloadMilkdropPack(index) => {
@@ -8089,7 +8146,7 @@ impl App {
                     self.winamp.presets.download(
                         pack,
                         self.dirs.milkdrop_dir(),
-                        ctx.clone(),
+                        self.waker.clone(),
                         self.applied_proxy.clone(),
                     );
                     self.toast(format!("Downloading {} presets", pack.name));
@@ -8275,14 +8332,144 @@ impl App {
         self.handle_media_commands();
         self.handle_tray();
         self.tick(ctx);
-        self.note_listening();
         // MilkDrop runs in a child process and can outlive the main window.
         // Poll it before applying actions because its keys produce actions.
         #[cfg(feature = "milkdrop")]
-        self.sync_milkdrop(ctx);
+        self.sync_milkdrop();
         self.apply_actions(ctx);
+        // Background commands can pause playback without another engine
+        // callback. Account for that change in this same wake.
+        self.note_listening();
         self.sync_media_controls(ctx);
         self.sync_window_title(ctx);
+    }
+
+    /// The next instant at which hidden state can change without a producer
+    /// waking the app. Every request completion uses the shared [`Waker`].
+    pub fn background_deadline(&self, now: Instant) -> Instant {
+        fn after(at: Instant, delay: Duration, now: Instant) -> Duration {
+            at.checked_add(delay)
+                .unwrap_or(now)
+                .saturating_duration_since(now)
+        }
+        fn held(at: Instant, delay: Duration, now: Instant) -> Option<Duration> {
+            let remaining = after(at, delay, now);
+            (!remaining.is_zero()).then_some(remaining)
+        }
+
+        let mut wait = after(self.last_eviction, CACHE_MAINTENANCE, now);
+        let mut consider = |duration: Duration| wait = wait.min(duration);
+
+        if self.automatic_update_check_eligible() {
+            consider(self.last_update_check.map_or(Duration::ZERO, |at| {
+                after(at, crate::updates::CHECK_INTERVAL, now)
+            }));
+        }
+
+        if self.is_connected() && !self.offline {
+            if !self.remote_poll_pending {
+                let interval = match self.target() {
+                    Target::Local if self.local.is_active() => REMOTE_POLL_IDLE,
+                    _ => REMOTE_POLL_ACTIVE,
+                };
+                consider(after(self.remote_polled_at, interval, now));
+            }
+            if let Some(due) = self.remote_recheck_at {
+                consider(due.saturating_duration_since(now));
+            }
+            if self.show_devices && !self.devices_loading {
+                consider(
+                    self.devices_fetched_at
+                        .map_or(Duration::ZERO, |at| after(at, DEVICES_FRESH, now)),
+                );
+            }
+            let playlist_open = self.settings.winamp_window && self.settings.playlist_open;
+            let queue_visible =
+                self.show_queue_panel || matches!(self.page(), Page::Queue) || playlist_open;
+            let remembered_queue = self.resume_only() && matches!(self.queue, Loadable::Loaded(_));
+            if queue_visible && !self.queue.is_loading() && !remembered_queue {
+                consider(
+                    self.queue_fetched_at
+                        .map_or(Duration::ZERO, |at| after(at, QUEUE_FRESH, now)),
+                );
+            }
+            if let Some(due) = self.liked_recheck_at
+                && !self.liked_songs.refreshing()
+            {
+                consider(due.saturating_duration_since(now));
+            }
+            if let Some(due) = self.queue_recheck_at {
+                consider(due.saturating_duration_since(now));
+            }
+        }
+
+        if let Some(typed) = self.search.typed_at {
+            consider(after(typed, SEARCH_DEBOUNCE, now));
+        }
+        if self.settings_dirty {
+            consider(after(self.last_settings_save, SAVE_DELAY, now));
+        }
+        if self.session_dirty {
+            consider(after(self.last_session_save, SAVE_DELAY, now));
+        }
+        for toast in &self.toasts {
+            consider(after(toast.created, TOAST_LIFETIME, now));
+        }
+
+        if let Some((_, at)) = self.optimistic_playing
+            && let Some(remaining) = held(at, PLAYBACK_HOLD, now)
+        {
+            consider(remaining);
+        }
+        if let Some(intent) = &self.intent_track
+            && self.queued_play.is_none()
+            && let Some(remaining) = held(intent.at, PLAYBACK_HOLD, now)
+        {
+            consider(remaining);
+        }
+        for at in [
+            self.pending_remote_position.map(|(_, at)| at),
+            self.pending_remote_volume.map(|(_, at)| at),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(remaining) = held(at, OPTIMISTIC_HOLD, now) {
+                consider(remaining);
+            }
+        }
+        if let Some(assumed) = &self.assumed_context
+            && let Some(remaining) = held(assumed.at, ASSUMED_CONTEXT_HOLD, now)
+        {
+            consider(remaining);
+        }
+        if let Some(remote) = &self.remote
+            && let Some(remaining) = held(remote.received_at, REMOTE_FRESH, now)
+        {
+            consider(remaining);
+        }
+
+        if let Some(listening) = &self.listening
+            && !listening.recorded
+            && let Some(since) = listening.playing_since
+            && let Some(playing) = self
+                .now_playing_live()
+                .filter(|playing| playing.uri == listening.uri && playing.playing)
+        {
+            let listened = listening.listened + now.saturating_duration_since(since);
+            consider(crate::history::counts_after(playing.duration_ms).saturating_sub(listened));
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(deadline) = self
+            .media_controls
+            .as_ref()
+            .and_then(|controls| controls.position_deadline(now))
+        {
+            consider(deadline.saturating_duration_since(now));
+        }
+
+        now.checked_add(wait).unwrap_or(now)
     }
 
     /// Records a track after enough active listening time.
@@ -13350,9 +13537,23 @@ mod tests {
         assert_eq!(app.settings.milkdrop_screen_hz, 0, "no screen has spoken");
         assert_eq!(app.settings.milkdrop_fps, crate::milkdrop::DEFAULT_FPS);
 
+        let observed = app.waker.generation();
         app.learn_screen_hz(144);
         assert_eq!(app.settings.milkdrop_screen_hz, 144);
         assert_eq!(app.settings.milkdrop_fps, 144, "smooth without being asked");
+        assert_ne!(
+            app.waker.generation(),
+            observed,
+            "the adopted rate gets a follow-up host update"
+        );
+
+        let observed = app.waker.generation();
+        app.apply(Action::SetMilkdropSeconds(17), &egui::Context::default());
+        assert_ne!(
+            app.waker.generation(),
+            observed,
+            "a UI setting changed after host sync gets a follow-up pass"
+        );
 
         // Keep the configured FPS when the screen changes.
         app.settings.milkdrop_fps = 30;
@@ -13501,6 +13702,29 @@ mod tests {
             app.backend.art().prefetch(&ctx, url),
             "the loader still remembers artwork that has been deleted"
         );
+    }
+
+    #[test]
+    fn window_lifecycle_releases_backdrop_graphics_without_clearing_lyrics() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.lyrics_uri = Some("spotify:track:lyrics-kept".into());
+        app.lyrics = Loadable::Failed("metadata kept".into());
+        app.lyrics_backdrop.seed_pending_for_test();
+
+        app.attach(&ctx);
+
+        assert!(app.lyrics_backdrop.is_released_for_test());
+        assert_eq!(app.lyrics_uri.as_deref(), Some("spotify:track:lyrics-kept"));
+        assert_eq!(app.lyrics, Loadable::Failed("metadata kept".into()));
+
+        app.lyrics_backdrop.seed_pending_for_test();
+        app.window_gone();
+
+        assert!(app.lyrics_backdrop.is_released_for_test());
+        assert_eq!(app.lyrics_uri.as_deref(), Some("spotify:track:lyrics-kept"));
+        assert_eq!(app.lyrics, Loadable::Failed("metadata kept".into()));
+        app.backend.shutdown();
     }
 
     #[test]
@@ -14256,6 +14480,193 @@ mod tests {
             REMOTE_POLL_IDLE,
             "paused local UI wait is 20s (already the API interval); 4s was only a tighter wake-up"
         );
+    }
+
+    #[test]
+    fn hidden_idle_deadline_is_maintenance_when_network_work_is_ineligible() {
+        let now = Instant::now();
+        let mut app = headless_app();
+        app.last_eviction = now;
+        app.offline = true;
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            CACHE_MAINTENANCE,
+            "offline demo state has no network polling deadline"
+        );
+
+        app.offline = false;
+        app.settings.check_for_updates = false;
+        app.auth = AuthStatus::SignedOut;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:paused".into(),
+            duration_ms: 200_000,
+            ..Default::default()
+        });
+        app.local.playback = Playback::Paused;
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            CACHE_MAINTENANCE,
+            "signed-out paused playback has no remote poll"
+        );
+    }
+
+    #[test]
+    fn hidden_deadline_chooses_dirty_search_and_recheck_work() {
+        let now = Instant::now();
+        let mut app = headless_app();
+        app.offline = true;
+        app.last_eviction = now;
+        app.settings_dirty = true;
+        app.last_settings_save = now;
+        assert_eq!(app.background_deadline(now).duration_since(now), SAVE_DELAY);
+
+        app.settings_dirty = false;
+        app.search.typed_at = Some(now);
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            SEARCH_DEBOUNCE
+        );
+
+        app.search.typed_at = None;
+        app.offline = false;
+        app.settings.check_for_updates = false;
+        app.auth = AuthStatus::Connected {
+            username: "listener".into(),
+        };
+        app.remote_poll_pending = true;
+        app.remote_recheck_at = Some(now + REMOTE_RECHECK);
+        app.queue_recheck_at = Some(now + QUEUE_RECHECK);
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            QUEUE_RECHECK
+        );
+    }
+
+    #[test]
+    fn blocked_update_and_remembered_queue_do_not_leave_an_overdue_deadline() {
+        let now = Instant::now();
+        let mut app = headless_app();
+        app.last_eviction = now;
+        app.auth = AuthStatus::Connected {
+            username: "listener".into(),
+        };
+        app.remote_poll_pending = true;
+        app.update_checking = true;
+        app.show_queue_panel = true;
+        app.resume_track = Some("spotify:track:remembered".into());
+        app.queue = Loadable::Loaded(Queue {
+            currently_playing: None,
+            queue: Vec::new(),
+        });
+        app.queue_fetched_at = None;
+
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            CACHE_MAINTENANCE,
+            "pending update and a resume-only queue wait for their producers"
+        );
+    }
+
+    #[test]
+    fn optimistic_expirations_wake_once_then_leave_the_maintenance_deadline() {
+        let now = Instant::now();
+        let mut app = headless_app();
+        app.offline = true;
+        app.last_eviction = now;
+        app.optimistic_playing = Some((false, now));
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            PLAYBACK_HOLD
+        );
+
+        let after_hold = now + PLAYBACK_HOLD + Duration::from_secs(1);
+        assert_eq!(
+            app.background_deadline(after_hold)
+                .duration_since(after_hold),
+            CACHE_MAINTENANCE - PLAYBACK_HOLD - Duration::from_secs(1),
+            "an expired read-only hold is not permanently overdue"
+        );
+
+        app.optimistic_playing = None;
+        app.pending_remote_position = Some((12_000, now));
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            OPTIMISTIC_HOLD
+        );
+
+        app.pending_remote_position = None;
+        app.expect_track("spotify:track:expected".into(), 0);
+        app.intent_track.as_mut().unwrap().at = now;
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            PLAYBACK_HOLD
+        );
+
+        app.intent_track = None;
+        app.assumed_context = Some(AssumedContext {
+            uri: "spotify:playlist:expected".into(),
+            shuffle: None,
+            at: now,
+        });
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            ASSUMED_CONTEXT_HOLD
+        );
+    }
+
+    #[test]
+    fn listening_deadline_counts_only_active_time() {
+        let now = Instant::now();
+        let mut app = headless_app();
+        app.offline = true;
+        app.last_eviction = now;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:short".into(),
+            duration_ms: 40_000,
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+        app.listening = Some(Listening {
+            uri: "spotify:track:short".into(),
+            listened: Duration::from_secs(5),
+            playing_since: Some(now - Duration::from_secs(3)),
+            recorded: false,
+        });
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            Duration::from_secs(12)
+        );
+
+        app.local.playback = Playback::Paused;
+        app.listening.as_mut().unwrap().playing_since = None;
+        assert_eq!(
+            app.background_deadline(now).duration_since(now),
+            CACHE_MAINTENANCE,
+            "paused time never schedules a history threshold"
+        );
+    }
+
+    #[test]
+    fn hidden_control_wake_applies_pause_and_stops_listening_without_a_ui_frame() {
+        let mut app = headless_app();
+        app.offline = true;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:hidden".into(),
+            duration_ms: 200_000,
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+        app.note_listening();
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(vec![ControlCommand::Pause]));
+        app.control_commands = Some(commands);
+        let observed = app.waker.generation();
+
+        app.waker.wake();
+        assert!(app.waker.wait_for_change(observed, Duration::from_secs(1)));
+        app.background_frame(&egui::Context::default());
+
+        assert!(!app.believed_playing());
+        assert!(app.listening.as_ref().unwrap().playing_since.is_none());
     }
 
     #[test]
@@ -17583,6 +17994,66 @@ mod tests {
         assert_eq!(
             app.control_devices_snapshot(),
             crate::single_instance::NO_DEVICES
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn control_snapshot_uses_optimistic_pause_and_seek_state() {
+        let sampled_at = Instant::now();
+        let mut app = headless_app();
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:local".into(),
+            title: "Local".into(),
+            duration_ms: 100_000,
+            ..Default::default()
+        });
+        app.local.position_ms = 20_000;
+        app.local.position_at = Some(sampled_at);
+        app.local.playback = Playback::Playing;
+        app.toggle_play();
+        let paused = app.timed_control_snapshot(sampled_at);
+        let paused_at_sample = paused.line_at(sampled_at);
+        let paused_later = paused.line_at(sampled_at + Duration::from_secs(5));
+        assert_eq!(
+            paused_later.split('\t').next(),
+            Some("paused"),
+            "the optimistic state reaches the control channel immediately"
+        );
+        assert_eq!(
+            paused_later.split('\t').nth(4),
+            paused_at_sample.split('\t').nth(4),
+            "the control channel freezes immediately on an optimistic pause"
+        );
+
+        app.local.track = None;
+        app.local.playback = Playback::Stopped;
+        app.optimistic_playing = None;
+        app.remote = Some(RemoteSnapshot {
+            state: PlaybackState {
+                is_playing: true,
+                progress_ms: Some(10_000),
+                item: Some(PlayableItem::Track(Track {
+                    id: Some("remote".into()),
+                    uri: "spotify:track:remote".into(),
+                    name: "Remote".into(),
+                    duration_ms: 100_000,
+                    ..Track::default()
+                })),
+                ..Default::default()
+            },
+            received_at: sampled_at,
+        });
+        app.seek(40_000);
+        let seek_sampled_at = Instant::now();
+        let seeked = app.timed_control_snapshot(seek_sampled_at);
+        assert_eq!(
+            seeked
+                .line_at(seek_sampled_at + Duration::from_millis(500))
+                .split('\t')
+                .nth(4),
+            Some("40500"),
+            "the published clock resets to the optimistic seek"
         );
     }
 

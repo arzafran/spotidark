@@ -64,16 +64,18 @@ struct Running {
 
 pub struct Host {
     tap: Arc<AudioTap>,
+    waker: crate::backend::Waker,
     /// Where the shared-memory ring file lives, one per app run.
     shm_path: PathBuf,
     running: Option<Running>,
 }
 
 impl Host {
-    pub fn new(tap: Arc<AudioTap>) -> Self {
+    pub fn new(tap: Arc<AudioTap>, waker: crate::backend::Waker) -> Self {
         let shm_path = std::env::temp_dir().join(format!("fastpotify-milkdrop-{}.pcm", pid()));
         Self {
             tap,
+            waker,
             shm_path,
             running: None,
         }
@@ -153,7 +155,7 @@ impl Host {
         let stdin = process.stdin.take().expect("child stdin was piped");
         let stdout = process.stdout.take().expect("child stdout was piped");
         let reported = Arc::new(Mutex::new(Reported::default()));
-        spawn_reader(stdout, Arc::clone(&reported));
+        spawn_reader(stdout, Arc::clone(&reported), self.waker.clone());
 
         // The child keeps the ring mapped by its own path; this side keeps
         // writing the sound into it.
@@ -276,7 +278,11 @@ impl Drop for Host {
 
 /// Reads the child's stdout, keeping the latest of what it reports and
 /// skipping libprojectM's own output on the same stream.
-fn spawn_reader(stdout: std::process::ChildStdout, reported: Arc<Mutex<Reported>>) {
+fn spawn_reader(
+    stdout: std::process::ChildStdout,
+    reported: Arc<Mutex<Reported>>,
+    waker: crate::backend::Waker,
+) {
     std::thread::Builder::new()
         .name("milkdrop-reader".into())
         .spawn(move || {
@@ -289,29 +295,33 @@ fn spawn_reader(stdout: std::process::ChildStdout, reported: Arc<Mutex<Reported>
                 let Ok(event) = serde_json::from_str::<Event>(json) else {
                     continue;
                 };
-                let mut reported = reported.lock().unwrap_or_else(|p| p.into_inner());
-                if event.closed == Some(true) {
-                    reported.closed = true;
-                }
-                if event.pos.is_some() {
-                    reported.pos = event.pos;
-                }
-                if event.size.is_some() {
-                    reported.size = event.size;
-                }
-                if event.screen_hz.is_some() {
-                    reported.screen_hz = event.screen_hz;
-                }
-                if let Some(command) = event.command {
-                    // A key held down cannot pile up more than a moment's
-                    // worth before the app takes them.
-                    if reported.commands.len() < 64 {
-                        reported.commands.push(command);
+                {
+                    let mut reported = reported.lock().unwrap_or_else(|p| p.into_inner());
+                    if event.closed == Some(true) {
+                        reported.closed = true;
+                    }
+                    if event.pos.is_some() {
+                        reported.pos = event.pos;
+                    }
+                    if event.size.is_some() {
+                        reported.size = event.size;
+                    }
+                    if event.screen_hz.is_some() {
+                        reported.screen_hz = event.screen_hz;
+                    }
+                    if let Some(command) = event.command {
+                        // A key held down cannot pile up more than a moment's
+                        // worth before the app takes them.
+                        if reported.commands.len() < 64 {
+                            reported.commands.push(command);
+                        }
                     }
                 }
+                waker.wake();
             }
             // Stdout closed: the child is gone.
             reported.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+            waker.wake();
         })
         .ok();
 }

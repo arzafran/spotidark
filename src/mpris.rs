@@ -72,6 +72,7 @@ impl MediaService {
     /// Publishes structural changes immediately; the position once a second
     /// while playing, since clients interpolate between updates.
     pub fn update(&mut self, state: MediaState) {
+        let now = Instant::now();
         let structural = self
             .published
             .as_ref()
@@ -83,12 +84,34 @@ impl MediaService {
             .as_ref()
             .is_none_or(|published| published.position_ms != state.position_ms);
         if !structural && (!position_changed || !position_due) {
+            if position_due && state.playback == Playback::Playing && !self.updates.is_closed() {
+                // A held optimistic position may be unchanged when its 1 Hz
+                // deadline arrives. Move that deadline forward without
+                // publishing a duplicate or leaving it permanently overdue.
+                self.last_position_update = now;
+            }
             return;
         }
         if self.updates.send(Update::State(state.clone())).is_ok() {
             self.published = Some(state);
-            self.last_position_update = Instant::now();
+            self.last_position_update = now;
         }
+    }
+
+    pub(crate) fn position_deadline(&self, now: Instant) -> Option<Instant> {
+        let state = self.published.as_ref()?;
+        let duration = state.track.as_ref()?.duration_ms;
+        if self.updates.is_closed()
+            || state.playback != Playback::Playing
+            || state.position_ms >= duration
+        {
+            return None;
+        }
+        Some(
+            self.last_position_update
+                .checked_add(PLAYING_POSITION_INTERVAL)
+                .unwrap_or(now),
+        )
     }
 
     pub fn seeked(&self, position_ms: u32) {
@@ -335,6 +358,62 @@ fn desktop_entry_for(app_id: Option<&str>, in_flatpak: bool) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn playing_state(position_ms: u32, duration_ms: u32) -> MediaState {
+        MediaState {
+            playback: Playback::Playing,
+            position_ms,
+            track: Some(MediaTrack {
+                duration_ms,
+                ..MediaTrack::default()
+            }),
+            ..MediaState::default()
+        }
+    }
+
+    #[test]
+    fn position_deadline_advances_without_duplicates_and_stops_at_the_end() {
+        let (updates, mut update_rx) = tokio_mpsc::unbounded_channel();
+        let (_command_tx, commands) = std::sync::mpsc::channel();
+        let now = Instant::now();
+        let state = playing_state(500, 5_000);
+        let mut service = MediaService {
+            updates,
+            commands,
+            published: Some(state.clone()),
+            last_position_update: now - PLAYING_POSITION_INTERVAL,
+        };
+
+        service.update(state);
+
+        assert!(
+            update_rx.try_recv().is_err(),
+            "an unchanged position is not republished"
+        );
+        let next = service
+            .position_deadline(now)
+            .expect("playing position has a deadline");
+        assert!(next > now);
+        assert_eq!(
+            next,
+            service.last_position_update + PLAYING_POSITION_INTERVAL,
+            "the unchanged sample advances the existing cadence exactly once"
+        );
+
+        service.published = Some(playing_state(5_000, 5_000));
+        assert_eq!(
+            service.position_deadline(now),
+            None,
+            "a capped clock stays idle"
+        );
+        drop(update_rx);
+        service.published = Some(playing_state(500, 5_000));
+        assert_eq!(
+            service.position_deadline(now),
+            None,
+            "an unavailable MPRIS service has no overdue deadline"
+        );
+    }
 
     #[test]
     fn desktop_entry_matches_the_installed_flatpak_id() {

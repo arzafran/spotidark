@@ -568,7 +568,7 @@ pub(crate) fn run() -> eframe::Result<()> {
         let persist_memory = options.persist_window;
         #[cfg(windows)]
         let thumbbar_enabled = desktop_surfaces && options.viewport.taskbar != Some(false);
-        eframe::run_native(
+        let result = eframe::run_native(
             "Spotidark",
             options,
             Box::new(move |cc| {
@@ -598,8 +598,8 @@ pub(crate) fn run() -> eframe::Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     fastpotify::mac_menu::init();
-                    let ctx = cc.egui_ctx.clone();
-                    fastpotify::mac_menu::set_waker(move || ctx.request_repaint());
+                    let wake = creator_waker.clone();
+                    fastpotify::mac_menu::set_waker(move || wake.wake());
                 }
                 {
                     use raw_window_handle::HasDisplayHandle;
@@ -635,8 +635,9 @@ pub(crate) fn run() -> eframe::Result<()> {
                 }))
             }),
         )
-        .inspect_err(|error| log::error!("Native window failed: {error}"))?;
+        .inspect_err(|error| log::error!("Native window failed: {error}"));
         waker.detach();
+        result?;
 
         let (switch, hide) = {
             let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
@@ -662,7 +663,13 @@ pub(crate) fn run() -> eframe::Result<()> {
             .as_mut()
             .expect("application state present")
             .window_gone();
+        let waiter = fastpotify::tray::HiddenWaiter::new(&waker);
         loop {
+            // Capture before draining every producer. A wake published while
+            // `background_frame` runs then remains visible to the wait.
+            let observed = waiter.generation();
+            let frame_started = std::time::Instant::now();
+            let deadline;
             {
                 let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
                 let app = guard.as_mut().expect("application state present");
@@ -670,8 +677,12 @@ pub(crate) fn run() -> eframe::Result<()> {
                 if app.quit_requested || app.wants_show {
                     break;
                 }
+                deadline = app.background_deadline(frame_started);
             }
-            fastpotify::tray::idle(std::time::Duration::from_millis(150));
+            let _ = waiter.wait(
+                observed,
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            );
         }
         let quit = {
             let guard = slot.lock().unwrap_or_else(|p| p.into_inner());

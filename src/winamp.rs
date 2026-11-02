@@ -199,9 +199,9 @@ impl WinampState {
     }
 
     /// Reads a skin from the folder on another thread.
-    pub fn load(&mut self, name: String, folder: &Path, ctx: &egui::Context) {
+    pub fn load(&mut self, name: String, folder: &Path, waker: &crate::backend::Waker) {
         let path = folder.join(&name);
-        self.spawn(ctx, move || Loaded {
+        self.spawn(waker, move || Loaded {
             result: Skin::load(&path),
             name,
             installed: false,
@@ -210,13 +210,13 @@ impl WinampState {
 
     /// Reads a skin from anywhere and, if it is one, copies it into the
     /// folder, on another thread.
-    pub fn install(&mut self, file: PathBuf, folder: &Path, ctx: &egui::Context) {
+    pub fn install(&mut self, file: PathBuf, folder: &Path, waker: &crate::backend::Waker) {
         let folder = folder.to_path_buf();
         let name = file
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.spawn(ctx, move || {
+        self.spawn(waker, move || {
             let result = Skin::load(&file).and_then(|skin| {
                 let destination = folder.join(&name);
                 if destination != file {
@@ -235,19 +235,23 @@ impl WinampState {
 
     /// Starts a job; one already running is left to finish unheard, so the
     /// latest request is the one that counts.
-    fn spawn(&mut self, ctx: &egui::Context, job: impl FnOnce() -> Loaded + Send + 'static) {
+    fn spawn(
+        &mut self,
+        waker: &crate::backend::Waker,
+        job: impl FnOnce() -> Loaded + Send + 'static,
+    ) {
         let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
+        let waker = waker.clone();
         let spawned = std::thread::Builder::new()
             .name("skin-loader".into())
             .spawn(move || {
                 let _ = sender.send(job());
-                ctx.request_repaint();
+                waker.wake();
             });
-        if let Err(error) = spawned {
-            log::warn!("could not start reading the skin: {error}");
+        match spawned {
+            Ok(_) => self.loading = Some(receiver),
+            Err(error) => log::warn!("could not start reading the skin: {error}"),
         }
-        self.loading = Some(receiver);
     }
 
     /// What a loading thread has finished with, if anything.

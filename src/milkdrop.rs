@@ -234,7 +234,7 @@ impl Presets {
         &mut self,
         pack: &'static Pack,
         folder: PathBuf,
-        ctx: egui::Context,
+        waker: crate::backend::Waker,
         proxy: crate::settings::ProxyConfig,
     ) {
         if self.download.is_some() {
@@ -245,7 +245,7 @@ impl Presets {
             .name("milkdrop-presets".into())
             .spawn(move || {
                 let _ = sender.send(fetch_pack(pack, &folder, &proxy));
-                ctx.request_repaint();
+                waker.wake();
             });
         match spawned {
             Ok(_) => self.download = Some((pack.name, receiver)),
@@ -258,7 +258,7 @@ impl Presets {
     pub fn download_missing(
         &mut self,
         folder: PathBuf,
-        ctx: egui::Context,
+        waker: crate::backend::Waker,
         proxy: crate::settings::ProxyConfig,
     ) {
         if self.download.is_some() {
@@ -284,7 +284,7 @@ impl Presets {
                     _ => Ok(total),
                 };
                 let _ = sender.send(outcome);
-                ctx.request_repaint();
+                waker.wake();
             });
         match spawned {
             Ok(_) => self.download = Some(("the preset packs", receiver)),

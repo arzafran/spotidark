@@ -7,7 +7,7 @@
 //! idle when nothing is happening.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
@@ -762,22 +762,230 @@ pub enum LocalPlayback {
 /// windows: the window is destroyed when it closes to the tray and created
 /// again on demand. They therefore hold this handle instead of an
 /// `egui::Context`.
+#[cfg(any(target_os = "macos", test))]
+type NativeWake = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Default)]
+struct WakeState {
+    context: Option<egui::Context>,
+    generation: u64,
+    #[cfg(any(target_os = "macos", test))]
+    native: Option<(u64, NativeWake)>,
+    #[cfg(any(target_os = "macos", test))]
+    next_registration: u64,
+}
+
+#[derive(Default)]
+struct WakeInner {
+    state: Mutex<WakeState>,
+    changed: Condvar,
+}
+
+impl WakeInner {
+    fn wake(&self) {
+        let context;
+        #[cfg(any(target_os = "macos", test))]
+        let native;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.generation = state.generation.wrapping_add(1);
+            context = state.context.clone();
+            #[cfg(any(target_os = "macos", test))]
+            {
+                native = state.native.as_ref().map(|(_, wake)| Arc::clone(wake));
+            }
+        }
+        self.changed.notify_all();
+        if let Some(context) = context {
+            context.request_repaint();
+        }
+        #[cfg(any(target_os = "macos", test))]
+        if let Some(native) = native {
+            native();
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct Waker(Arc<std::sync::Mutex<Option<egui::Context>>>);
+pub struct Waker(Arc<WakeInner>);
+
+/// A completion wake that cannot keep a retired window context alive.
+#[derive(Clone, Default)]
+pub(crate) struct WeakWaker(Weak<WakeInner>);
 
 impl Waker {
     pub fn attach(&self, ctx: &egui::Context) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(ctx.clone());
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context = Some(ctx.clone());
     }
 
     pub fn detach(&self) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context = None;
     }
 
     pub fn wake(&self) {
-        if let Some(ctx) = self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            ctx.request_repaint();
+        self.0.wake();
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakWaker {
+        WeakWaker(Arc::downgrade(&self.0))
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
+    }
+
+    pub(crate) fn wait_for_change(&self, observed: u64, duration: Duration) -> bool {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.generation != observed {
+            return true;
         }
+        let (state, _) = self
+            .0
+            .changed
+            .wait_timeout_while(state, duration, |state| state.generation == observed)
+            .unwrap_or_else(|p| p.into_inner());
+        state.generation != observed
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn register_native_wake(&self, wake: NativeWake) -> u64 {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.next_registration = state.next_registration.wrapping_add(1).max(1);
+        let token = state.next_registration;
+        state.native = Some((token, wake));
+        token
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn unregister_native_wake(&self, token: u64) {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .native
+            .as_ref()
+            .is_some_and(|(current, _)| *current == token)
+        {
+            state.native = None;
+        }
+    }
+}
+
+impl WeakWaker {
+    pub(crate) fn wake(&self) {
+        if let Some(waker) = self.0.upgrade() {
+            waker.wake();
+        }
+    }
+}
+
+#[cfg(test)]
+mod waker_tests {
+    use super::Waker;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn wake_is_sticky_when_it_arrives_before_the_wait() {
+        let waker = Waker::default();
+        let observed = waker.generation();
+
+        waker.wake();
+
+        assert!(waker.wait_for_change(observed, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn worker_wake_releases_a_hidden_wait() {
+        let waker = Waker::default();
+        let observed = waker.generation();
+        let worker = waker.clone();
+        let (go, start) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            start.recv().unwrap();
+            worker.wake();
+        });
+
+        go.send(()).unwrap();
+        assert!(waker.wait_for_change(observed, Duration::from_secs(2)));
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn notifications_without_a_new_generation_still_reach_the_deadline() {
+        let waker = Waker::default();
+        let observed = waker.generation();
+        let inner = Arc::clone(&waker.0);
+        let notifying = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_flag = Arc::clone(&notifying);
+        let worker = std::thread::spawn(move || {
+            while worker_flag.load(std::sync::atomic::Ordering::Acquire) {
+                inner.changed.notify_all();
+                std::thread::yield_now();
+            }
+        });
+
+        let changed = waker.wait_for_change(observed, Duration::from_millis(10));
+        notifying.store(false, std::sync::atomic::Ordering::Release);
+        worker.join().unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn stale_native_registration_cannot_clear_the_current_one() {
+        let waker = Waker::default();
+        let first_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_counter = Arc::clone(&first_count);
+        let first = waker.register_native_wake(Arc::new(move || {
+            first_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let second_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_counter = Arc::clone(&second_count);
+        let _second = waker.register_native_wake(Arc::new(move || {
+            second_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        waker.unregister_native_wake(first);
+        waker.wake();
+
+        assert_eq!(first_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(second_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_waker_releases_the_old_window_context() {
+        let waker = Waker::default();
+        let completion_wake = waker.downgrade();
+        let marker = Arc::new(());
+        let marker_weak = Arc::downgrade(&marker);
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("waker-context-lifetime"), Arc::clone(&marker))
+        });
+        waker.attach(&ctx);
+        drop(marker);
+        drop(ctx);
+
+        assert!(marker_weak.upgrade().is_some());
+        waker.detach();
+        assert!(marker_weak.upgrade().is_none());
+
+        // Late work can still use the completion handle after detach.
+        completion_wake.wake();
+
+        let next = egui::Context::default();
+        waker.attach(&next);
+        waker.detach();
     }
 }
 
@@ -827,7 +1035,12 @@ impl Backend {
                 Http::unavailable(error)
             })
         };
-        let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
+        let art = ArtLoader::new(
+            http.clone(),
+            runtime.handle().clone(),
+            dirs.art_cache_dir(),
+            waker.downgrade(),
+        );
         let activity = Arc::new(NetActivity::default());
 
         let worker_activity = Arc::clone(&activity);
@@ -4225,7 +4438,12 @@ mod authorization_tests {
             crate::eq::shared(),
         );
         let http = Http::new(reqwest::Client::new());
-        let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
+        let art = ArtLoader::new(
+            http.clone(),
+            runtime.handle().clone(),
+            dirs.art_cache_dir(),
+            Waker::default().downgrade(),
+        );
         let (sender, events) = std::sync::mpsc::channel();
         let (commands, _) = mpsc::unbounded_channel();
         let worker = Worker::new(

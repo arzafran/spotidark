@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use egui::load::{
     Bytes, BytesLoadResult, BytesLoader, BytesPoll, ImageLoadResult, ImageLoader, ImagePoll,
-    LoadError, SizeHint,
+    LoadError, SizeHint, SizedTexture, TextureLoadResult, TextureLoader, TexturePoll,
 };
 use image::ImageDecoder;
 use sha1::{Digest, Sha1};
 use tokio::sync::Semaphore;
 
+use crate::backend::WeakWaker;
 use crate::http::Http;
 
 /// Maximum artwork bytes held in memory.
@@ -46,12 +47,44 @@ fn is_http(uri: &str) -> bool {
     uri.starts_with("https://") || uri.starts_with("http://")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RasterTarget {
+    Bucket(u32),
+    Full,
+}
+
+impl RasterTarget {
+    fn from_hint(hint: SizeHint) -> Self {
+        match hint {
+            SizeHint::Scale(_) => Self::Full,
+            SizeHint::Width(width) => Self::Bucket(raster_bucket(width)),
+            SizeHint::Height(height) => Self::Bucket(raster_bucket(height)),
+            SizeHint::Size { width, height, .. } => Self::Bucket(raster_bucket(width.max(height))),
+        }
+    }
+}
+
+fn raster_bucket(physical_pixels: u32) -> u32 {
+    physical_pixels.clamp(1, 8192).next_power_of_two().max(64)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecodeRequest {
+    id: u64,
+    target: RasterTarget,
+}
+
 struct Entry {
     request: Option<u64>,
     bytes: Option<Arc<[u8]>>,
     error: Option<String>,
     decoded: Option<Result<Arc<egui::ColorImage>, String>>,
-    decoding: Option<u64>,
+    completed_target: Option<RasterTarget>,
+    decoded_full: bool,
+    decoded_revision: u64,
+    decoding: Option<DecodeRequest>,
+    pending_target: Option<RasterTarget>,
+    failed_target: Option<RasterTarget>,
     last_used: Instant,
     /// Decoded image and GPU texture once painted, excluding compressed bytes.
     raster_bytes: usize,
@@ -64,7 +97,12 @@ impl Default for Entry {
             bytes: None,
             error: None,
             decoded: None,
+            completed_target: None,
+            decoded_full: false,
+            decoded_revision: 0,
             decoding: None,
+            pending_target: None,
+            failed_target: None,
             last_used: Instant::now(),
             raster_bytes: 0,
         }
@@ -74,6 +112,28 @@ impl Default for Entry {
 impl Entry {
     fn retained_bytes(&self) -> usize {
         self.bytes.as_ref().map_or(0, |bytes| bytes.len()) + self.raster_bytes
+    }
+
+    fn ready(&self) -> Option<(Arc<egui::ColorImage>, u64)> {
+        self.decoded
+            .as_ref()?
+            .as_ref()
+            .ok()
+            .map(|image| (Arc::clone(image), self.decoded_revision))
+    }
+
+    fn satisfies(&self, target: RasterTarget) -> bool {
+        self.ready().is_some()
+            && (self.decoded_full
+                || self
+                    .completed_target
+                    .is_some_and(|completed| completed >= target))
+    }
+
+    fn request_later(&mut self, target: RasterTarget) {
+        if self.decoding.is_some_and(|request| target > request.target) {
+            self.pending_target = Some(self.pending_target.map_or(target, |old| old.max(target)));
+        }
     }
 }
 
@@ -85,6 +145,8 @@ struct Inner {
     fetch_jobs: Arc<Semaphore>,
     decode_jobs: Arc<Semaphore>,
     accent_jobs: Arc<Semaphore>,
+    graphics_generation: AtomicU64,
+    waker: WeakWaker,
 }
 
 #[derive(Clone)]
@@ -92,8 +154,41 @@ pub struct ArtLoader {
     inner: Arc<Inner>,
 }
 
+enum DecodedPoll {
+    Pending {
+        source_size: Option<egui::Vec2>,
+    },
+    Ready {
+        image: Arc<egui::ColorImage>,
+        revision: u64,
+        complete: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextureKey {
+    uri: String,
+    options: egui::TextureOptions,
+}
+
+struct TextureEntry {
+    handle: egui::TextureHandle,
+    revision: u64,
+    source_size: egui::Vec2,
+}
+
+struct ArtTextureLoader {
+    art: ArtLoader,
+    textures: Mutex<HashMap<TextureKey, TextureEntry>>,
+}
+
 impl ArtLoader {
-    pub fn new(http: impl Into<Http>, runtime: tokio::runtime::Handle, cache_dir: PathBuf) -> Self {
+    pub(crate) fn new(
+        http: impl Into<Http>,
+        runtime: tokio::runtime::Handle,
+        cache_dir: PathBuf,
+        waker: WeakWaker,
+    ) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
         Self {
             inner: Arc::new(Inner {
@@ -104,6 +199,8 @@ impl ArtLoader {
                 fetch_jobs: Arc::new(Semaphore::new(FETCH_JOBS)),
                 decode_jobs: Arc::new(Semaphore::new(DECODE_JOBS)),
                 accent_jobs: Arc::new(Semaphore::new(2)),
+                graphics_generation: AtomicU64::new(0),
+                waker,
             }),
         }
     }
@@ -116,6 +213,14 @@ impl ArtLoader {
     /// HTTP artwork uses the same cache and decode budget as accent/backdrop work.
     pub fn image_loader(&self) -> impl ImageLoader + Send + Sync + 'static {
         ArtImageLoader(self.clone())
+    }
+
+    /// HTTP artwork textures can grow when a cover is later painted larger.
+    pub fn texture_loader(&self) -> impl TextureLoader + Send + Sync + 'static {
+        ArtTextureLoader {
+            art: self.clone(),
+            textures: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn accent(&self, url: &str) -> Option<[u8; 3]> {
@@ -200,7 +305,7 @@ impl ArtLoader {
     ///
     /// Artwork already held, already on its way, or addressed by a scheme
     /// this loader does not answer for is left alone.
-    pub fn prefetch(&self, ctx: &egui::Context, url: &str) -> bool {
+    pub fn prefetch(&self, _ctx: &egui::Context, url: &str) -> bool {
         if !is_http(url) {
             return false;
         }
@@ -223,7 +328,7 @@ impl ArtLoader {
             },
         );
         drop(entries);
-        self.inner.start(ctx, url.to_string(), request);
+        self.inner.start(url.to_string(), request);
         true
     }
 
@@ -233,16 +338,24 @@ impl ArtLoader {
         self.inner.drop_bytes(url);
     }
 
-    /// Record decoded image + texture size after egui has uploaded the cover.
-    pub fn note_decoded(&self, url: &str, width: usize, height: usize) {
-        if let Some(entry) = self
-            .inner
-            .entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_mut(url)
-        {
-            entry.raster_bytes = decoded_and_texture_bytes(width, height);
+    /// Releases decoded pixels and their GPU accounting when no window owns
+    /// those graphics. Encoded bytes and disk files remain available.
+    pub fn release_graphics(&self) {
+        self.inner
+            .graphics_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
+        for entry in entries.values_mut() {
+            if entry.decoded.as_ref().is_some_and(Result::is_ok) {
+                entry.error = None;
+            }
+            entry.decoded = None;
+            entry.completed_target = None;
+            entry.decoded_full = false;
+            entry.decoding = None;
+            entry.pending_target = None;
+            entry.failed_target = None;
+            entry.raster_bytes = 0;
         }
     }
 
@@ -256,6 +369,188 @@ impl ArtLoader {
             }
         }
         Ok(removed)
+    }
+
+    fn poll_decoded(
+        &self,
+        ctx: &egui::Context,
+        uri: &str,
+        hint: SizeHint,
+    ) -> Result<DecodedPoll, LoadError> {
+        if !is_http(uri) {
+            return Err(LoadError::NotSupported);
+        }
+        let requested = RasterTarget::from_hint(hint);
+        let mut ready = None;
+        {
+            let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = entries.get_mut(uri) {
+                entry.last_used = Instant::now();
+                ready = entry.ready();
+                let target = entry
+                    .pending_target
+                    .map_or(requested, |pending| pending.max(requested));
+                if entry.satisfies(target) {
+                    entry.pending_target = None;
+                    let (image, revision) = ready.expect("a satisfied image");
+                    return Ok(DecodedPoll::Ready {
+                        image,
+                        revision,
+                        complete: true,
+                    });
+                }
+                if entry.failed_target.is_some_and(|failed| target <= failed) {
+                    if let Some((image, revision)) = ready {
+                        return Ok(DecodedPoll::Ready {
+                            image,
+                            revision,
+                            complete: false,
+                        });
+                    }
+                    let error = entry
+                        .decoded
+                        .as_ref()
+                        .and_then(|decoded| decoded.as_ref().err())
+                        .cloned()
+                        .unwrap_or_else(|| "artwork could not be decoded".into());
+                    return Err(LoadError::Loading(error));
+                }
+                if entry.decoding.is_some() {
+                    entry.request_later(target);
+                    return Ok(match ready {
+                        Some((image, revision)) => DecodedPoll::Ready {
+                            image,
+                            revision,
+                            complete: false,
+                        },
+                        None => DecodedPoll::Pending { source_size: None },
+                    });
+                }
+                entry.pending_target = Some(target);
+            }
+        }
+
+        let bytes = match self.load(ctx, uri) {
+            Ok(BytesPoll::Pending { size }) => {
+                let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(entry) = entries.get_mut(uri) {
+                    entry.pending_target = Some(
+                        entry
+                            .pending_target
+                            .map_or(requested, |pending| pending.max(requested)),
+                    );
+                }
+                return Ok(match ready {
+                    Some((image, revision)) => DecodedPoll::Ready {
+                        image,
+                        revision,
+                        complete: false,
+                    },
+                    None => DecodedPoll::Pending { source_size: size },
+                });
+            }
+            Ok(BytesPoll::Ready { bytes, .. }) => bytes,
+            Err(error) => {
+                return match ready {
+                    Some((image, revision)) => Ok(DecodedPoll::Ready {
+                        image,
+                        revision,
+                        complete: false,
+                    }),
+                    None => Err(error),
+                };
+            }
+        };
+        let Ok(permit) = self.inner.decode_jobs.clone().try_acquire_owned() else {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return Ok(match ready {
+                Some((image, revision)) => DecodedPoll::Ready {
+                    image,
+                    revision,
+                    complete: false,
+                },
+                None => DecodedPoll::Pending { source_size: None },
+            });
+        };
+
+        let request = request_id();
+        let (target, generation, ready) = {
+            let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(entry) = entries.get_mut(uri) else {
+                return Ok(DecodedPoll::Pending { source_size: None });
+            };
+            let ready = entry.ready();
+            let target = entry
+                .pending_target
+                .map_or(requested, |pending| pending.max(requested));
+            if entry.satisfies(target) {
+                entry.pending_target = None;
+                let (image, revision) = ready.expect("a satisfied image");
+                return Ok(DecodedPoll::Ready {
+                    image,
+                    revision,
+                    complete: true,
+                });
+            }
+            if entry.failed_target.is_some_and(|failed| target <= failed) {
+                if let Some((image, revision)) = ready {
+                    return Ok(DecodedPoll::Ready {
+                        image,
+                        revision,
+                        complete: false,
+                    });
+                }
+                let error = entry
+                    .decoded
+                    .as_ref()
+                    .and_then(|decoded| decoded.as_ref().err())
+                    .cloned()
+                    .unwrap_or_else(|| "artwork could not be decoded".into());
+                return Err(LoadError::Loading(error));
+            }
+            if entry.decoding.is_some() {
+                entry.request_later(target);
+                return Ok(match ready {
+                    Some((image, revision)) => DecodedPoll::Ready {
+                        image,
+                        revision,
+                        complete: false,
+                    },
+                    None => DecodedPoll::Pending { source_size: None },
+                });
+            }
+            entry.decoding = Some(DecodeRequest {
+                id: request,
+                target,
+            });
+            entry.pending_target = None;
+            if entry.decoded.as_ref().is_some_and(Result::is_err) {
+                entry.decoded = None;
+            }
+            (
+                target,
+                self.inner.graphics_generation.load(Ordering::Acquire),
+                ready,
+            )
+        };
+        let loader = self.clone();
+        let uri = uri.to_string();
+        self.inner.runtime.spawn_blocking(move || {
+            let _permit = permit;
+            let decoded = decode_art_raster(&bytes, target);
+            loader
+                .inner
+                .complete_decode(&uri, request, target, generation, decoded);
+            loader.inner.waker.wake();
+        });
+        Ok(match ready {
+            Some((image, revision)) => DecodedPoll::Ready {
+                image,
+                revision,
+                complete: false,
+            },
+            None => DecodedPoll::Pending { source_size: None },
+        })
     }
 }
 
@@ -366,13 +661,12 @@ impl Inner {
             .and_then(|entry| entry.bytes.clone())
     }
 
-    fn start(self: &Arc<Self>, ctx: &egui::Context, url: String, request: u64) {
+    fn start(self: &Arc<Self>, url: String, request: u64) {
         let loader = Arc::clone(self);
-        let ctx = ctx.clone();
         self.runtime.spawn(async move {
             let result = loader.fetch(&url).await;
             loader.complete(&url, request, result);
-            ctx.request_repaint();
+            loader.waker.wake();
         });
     }
 
@@ -401,6 +695,56 @@ impl Inner {
             .get_mut(url)
         {
             entry.bytes = None;
+        }
+    }
+
+    fn complete_decode(
+        &self,
+        uri: &str,
+        request: u64,
+        target: RasterTarget,
+        generation: u64,
+        decoded: Result<(Arc<egui::ColorImage>, bool), String>,
+    ) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if self.graphics_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Some(entry) = entries.get_mut(uri).filter(|entry| {
+            entry.decoding
+                == Some(DecodeRequest {
+                    id: request,
+                    target,
+                })
+        }) {
+            entry.decoding = None;
+            match decoded {
+                Ok((image, full)) => {
+                    entry.raster_bytes = decoded_and_texture_bytes(image.size[0], image.size[1]);
+                    entry.completed_target = Some(target);
+                    entry.decoded_full = full;
+                    entry.decoded_revision = entry.decoded_revision.wrapping_add(1).max(1);
+                    entry.decoded = Some(Ok(image));
+                    entry.failed_target = None;
+                    if full
+                        || entry
+                            .pending_target
+                            .is_some_and(|pending| pending <= target)
+                    {
+                        entry.pending_target = None;
+                    }
+                }
+                Err(error) => {
+                    entry.failed_target = Some(
+                        entry
+                            .failed_target
+                            .map_or(target, |failed| failed.max(target)),
+                    );
+                    if entry.ready().is_none() {
+                        entry.decoded = Some(Err(error));
+                    }
+                }
+            }
         }
     }
 }
@@ -477,7 +821,7 @@ impl BytesLoader for ArtLoader {
         // the decoded image and texture accounting throughout that reload.
         entries.entry(uri.to_string()).or_default().request = Some(request);
         drop(entries);
-        self.inner.start(ctx, uri.to_string(), request);
+        self.inner.start(uri.to_string(), request);
         Ok(BytesPoll::Pending { size: None })
     }
 
@@ -526,87 +870,11 @@ impl ImageLoader for ArtImageLoader {
         "fastpotify::ArtImageLoader"
     }
 
-    fn load(&self, ctx: &egui::Context, uri: &str, _: SizeHint) -> ImageLoadResult {
-        if !is_http(uri) {
-            return Err(LoadError::NotSupported);
+    fn load(&self, ctx: &egui::Context, uri: &str, hint: SizeHint) -> ImageLoadResult {
+        match self.0.poll_decoded(ctx, uri, hint)? {
+            DecodedPoll::Pending { source_size } => Ok(ImagePoll::Pending { size: source_size }),
+            DecodedPoll::Ready { image, .. } => Ok(ImagePoll::Ready { image }),
         }
-        {
-            let mut entries = self
-                .0
-                .inner
-                .entries
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Some(entry) = entries.get_mut(uri) {
-                entry.last_used = Instant::now();
-                if let Some(decoded) = &entry.decoded {
-                    return decoded
-                        .clone()
-                        .map(|image| ImagePoll::Ready { image })
-                        .map_err(LoadError::Loading);
-                }
-                if entry.decoding.is_some() {
-                    return Ok(ImagePoll::Pending { size: None });
-                }
-            }
-        }
-        let bytes = match self.0.load(ctx, uri)? {
-            BytesPoll::Pending { size } => return Ok(ImagePoll::Pending { size }),
-            BytesPoll::Ready { bytes, .. } => bytes,
-        };
-        let Ok(permit) = self.0.inner.decode_jobs.clone().try_acquire_owned() else {
-            ctx.request_repaint_after(Duration::from_millis(50));
-            return Ok(ImagePoll::Pending { size: None });
-        };
-        let request = request_id();
-        {
-            let mut entries = self
-                .0
-                .inner
-                .entries
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let Some(entry) = entries.get_mut(uri) else {
-                return Ok(ImagePoll::Pending { size: None });
-            };
-            if entry.decoding.is_some() || entry.decoded.is_some() {
-                return Ok(ImagePoll::Pending { size: None });
-            }
-            entry.decoding = Some(request);
-        }
-        let loader = self.0.clone();
-        let ctx = ctx.clone();
-        let uri = uri.to_string();
-        self.0.inner.runtime.spawn_blocking(move || {
-            let _permit = permit;
-            let decoded = decode_art(&bytes).map(|image| {
-                let rgba = image.into_rgba8();
-                Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                ))
-            });
-            {
-                let mut entries = loader
-                    .inner
-                    .entries
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                if let Some(entry) = entries
-                    .get_mut(&uri)
-                    .filter(|entry| entry.decoding == Some(request))
-                {
-                    entry.decoding = None;
-                    if let Ok(image) = &decoded {
-                        entry.raster_bytes =
-                            decoded_and_texture_bytes(image.size[0], image.size[1]);
-                    }
-                    entry.decoded = Some(decoded);
-                }
-            }
-            ctx.request_repaint();
-        });
-        Ok(ImagePoll::Pending { size: None })
     }
 
     fn forget(&self, uri: &str) {
@@ -634,6 +902,97 @@ impl ImageLoader for ArtImageLoader {
             .unwrap_or_else(|p| p.into_inner())
             .values()
             .any(|entry| entry.request.is_some() || entry.decoding.is_some())
+    }
+}
+
+impl TextureLoader for ArtTextureLoader {
+    fn id(&self) -> &str {
+        "fastpotify::ArtTextureLoader"
+    }
+
+    fn load(
+        &self,
+        ctx: &egui::Context,
+        uri: &str,
+        texture_options: egui::TextureOptions,
+        size_hint: SizeHint,
+    ) -> TextureLoadResult {
+        if !is_http(uri) {
+            return Err(LoadError::NotSupported);
+        }
+        let key = TextureKey {
+            uri: uri.to_owned(),
+            options: texture_options,
+        };
+        match self.art.poll_decoded(ctx, uri, size_hint) {
+            Ok(DecodedPoll::Ready {
+                image,
+                revision,
+                complete,
+            }) => {
+                let source_size = image.source_size;
+                let mut textures = self.textures.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = textures.entry(key).or_insert_with(|| TextureEntry {
+                    handle: ctx.load_texture(uri, Arc::clone(&image), texture_options),
+                    revision,
+                    source_size,
+                });
+                if entry.revision != revision {
+                    entry.handle.set(image, texture_options);
+                    entry.revision = revision;
+                    entry.source_size = source_size;
+                }
+                let texture = SizedTexture::new(entry.handle.id(), entry.source_size);
+                drop(textures);
+                if complete {
+                    self.art.release_bytes(uri);
+                }
+                Ok(TexturePoll::Ready { texture })
+            }
+            Ok(DecodedPoll::Pending { source_size }) => {
+                let textures = self.textures.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(entry) = textures.get(&key) {
+                    Ok(TexturePoll::Ready {
+                        texture: SizedTexture::new(entry.handle.id(), entry.source_size),
+                    })
+                } else {
+                    Ok(TexturePoll::Pending { size: source_size })
+                }
+            }
+            Err(error) => {
+                let textures = self.textures.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(entry) = textures.get(&key) {
+                    Ok(TexturePoll::Ready {
+                        texture: SizedTexture::new(entry.handle.id(), entry.source_size),
+                    })
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn forget(&self, uri: &str) {
+        self.textures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key, _| key.uri != uri);
+    }
+
+    fn forget_all(&self) {
+        self.textures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    fn byte_size(&self) -> usize {
+        self.textures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|entry| entry.handle.byte_size())
+            .sum()
     }
 }
 
@@ -679,6 +1038,23 @@ pub struct LyricsBackdrop {
 }
 
 impl LyricsBackdrop {
+    pub fn release_graphics(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_pending_for_test(&mut self) {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        self.uri = Some("https://i.scdn.co/image/backdrop".into());
+        self.requested = true;
+        self.pending = Some(receiver);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_released_for_test(&self) -> bool {
+        self.uri.is_none() && !self.requested && self.pending.is_none() && self.texture.is_none()
+    }
+
     pub fn texture(
         &mut self,
         ctx: &egui::Context,
@@ -702,11 +1078,11 @@ impl LyricsBackdrop {
                     self.requested = true;
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.pending = Some(rx);
-                    let ctx = ctx.clone();
+                    let waker = loader.inner.waker.clone();
                     loader.inner.runtime.spawn_blocking(move || {
                         let _permit = permit;
                         let _ = tx.send(lyrics_background(&bytes));
-                        ctx.request_repaint();
+                        waker.wake();
                     });
                 }
                 Err(error) => self.requested = terminal_lyrics_backdrop_error(&error),
@@ -759,6 +1135,35 @@ fn decode_art(bytes: &[u8]) -> Result<image::DynamicImage, String> {
         image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
     image.apply_orientation(orientation);
     Ok(image)
+}
+
+fn decode_art_raster(
+    bytes: &[u8],
+    target: RasterTarget,
+) -> Result<(Arc<egui::ColorImage>, bool), String> {
+    let image = decode_art(bytes)?;
+    let source = [image.width(), image.height()];
+    let (image, full) = match target {
+        RasterTarget::Full => (image, true),
+        RasterTarget::Bucket(bucket) if source[0].min(source[1]) <= bucket => (image, true),
+        RasterTarget::Bucket(bucket) => {
+            let short = source[0].min(source[1]) as f64;
+            let scale = bucket as f64 / short;
+            let width = (source[0] as f64 * scale).round().max(1.0) as u32;
+            let height = (source[1] as f64 * scale).round().max(1.0) as u32;
+            (
+                image.resize_exact(width, height, image::imageops::FilterType::Triangle),
+                false,
+            )
+        }
+    };
+    let rgba = image.into_rgba8();
+    let mut image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    image.source_size = egui::vec2(source[0] as f32, source[1] as f32);
+    Ok((Arc::new(image), full))
 }
 
 fn lyrics_background(bytes: &[u8]) -> Option<egui::ColorImage> {
@@ -817,7 +1222,379 @@ mod tests {
                 .unwrap(),
             runtime.handle().clone(),
             dir,
+            crate::backend::Waker::default().downgrade(),
         )
+    }
+
+    fn png(width: u32, height: u32) -> Arc<[u8]> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba([20, 40, 80, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        Arc::from(bytes.into_inner())
+    }
+
+    fn texture_size(ctx: &egui::Context, id: egui::TextureId) -> [usize; 2] {
+        let manager = ctx.tex_manager();
+        manager.read().meta(id).expect("texture metadata").size
+    }
+
+    fn wait_for_texture(
+        textures: &impl TextureLoader,
+        ctx: &egui::Context,
+        url: &str,
+        hint: SizeHint,
+        expected: [usize; 2],
+    ) -> SizedTexture {
+        for _ in 0..200 {
+            if let Ok(TexturePoll::Ready { texture }) =
+                textures.load(ctx, url, egui::TextureOptions::LINEAR, hint)
+                && texture_size(ctx, texture.id) == expected
+            {
+                return texture;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("texture never reached {expected:?}");
+    }
+
+    #[test]
+    fn physical_hints_choose_upward_buckets_and_rectangles_cover_the_crop() {
+        assert_eq!(
+            RasterTarget::from_hint(SizeHint::Size {
+                width: 96,
+                height: 96,
+                maintain_aspect_ratio: true,
+            }),
+            RasterTarget::Bucket(128)
+        );
+        assert_eq!(
+            RasterTarget::from_hint(SizeHint::Size {
+                width: 512,
+                height: 256,
+                maintain_aspect_ratio: true,
+            }),
+            RasterTarget::Bucket(512)
+        );
+        assert_eq!(
+            RasterTarget::from_hint(SizeHint::Scale(2.0.into())),
+            RasterTarget::Full
+        );
+
+        let bytes = png(1600, 800);
+        let (small, full) = decode_art_raster(&bytes, RasterTarget::Bucket(128)).unwrap();
+        assert_eq!(small.size, [256, 128]);
+        assert_eq!(small.source_size, egui::vec2(1600.0, 800.0));
+        assert!(!full);
+
+        let (source_sized, full) = decode_art_raster(&bytes, RasterTarget::Bucket(1024)).unwrap();
+        assert_eq!(source_sized.size, [1600, 800]);
+        assert!(full, "a source below the bucket becomes terminal");
+    }
+
+    #[test]
+    fn sized_rasters_preserve_exif_orientation_and_original_aspect_metadata() {
+        use image::ImageEncoder as _;
+
+        let pixels = image::RgbImage::from_pixel(120, 240, image::Rgb([80, 30, 10]));
+        let mut bytes = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90);
+        encoder
+            .set_exif_metadata(vec![
+                b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0,
+                0, 0, 0,
+            ])
+            .unwrap();
+        encoder
+            .encode(
+                pixels.as_raw(),
+                pixels.width(),
+                pixels.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+
+        let (raster, full) = decode_art_raster(&bytes, RasterTarget::Bucket(64)).unwrap();
+        assert_eq!(raster.source_size, egui::vec2(240.0, 120.0));
+        assert_eq!(raster.size, [128, 64]);
+        assert!(!full);
+    }
+
+    #[test]
+    fn one_texture_upgrades_in_place_without_downgrading() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotidark-art-sized-texture-{}-{}",
+            std::process::id(),
+            request_id()
+        ));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        let ctx = egui::Context::default();
+        let url = "https://i.scdn.co/image/sized-texture";
+        let bytes = png(640, 640);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(loader.inner.cache_path(url), &*bytes).unwrap();
+        loader.inner.entries.lock().unwrap().insert(
+            url.into(),
+            Entry {
+                bytes: Some(bytes),
+                ..Entry::default()
+            },
+        );
+        let textures = loader.texture_loader();
+        let small = wait_for_texture(
+            &textures,
+            &ctx,
+            url,
+            SizeHint::Size {
+                width: 96,
+                height: 96,
+                maintain_aspect_ratio: true,
+            },
+            [128, 128],
+        );
+        let first_id = small.id;
+
+        let old = textures
+            .load(
+                &ctx,
+                url,
+                egui::TextureOptions::LINEAR,
+                SizeHint::Size {
+                    width: 512,
+                    height: 512,
+                    maintain_aspect_ratio: true,
+                },
+            )
+            .unwrap();
+        let TexturePoll::Ready { texture: old } = old else {
+            panic!("the smaller texture must remain visible during an upgrade")
+        };
+        assert_eq!(old.id, first_id);
+        assert_eq!(texture_size(&ctx, first_id), [128, 128]);
+
+        let large = wait_for_texture(
+            &textures,
+            &ctx,
+            url,
+            SizeHint::Size {
+                width: 512,
+                height: 512,
+                maintain_aspect_ratio: true,
+            },
+            [512, 512],
+        );
+        assert_eq!(large.id, first_id, "the existing handle is upgraded");
+        let repeated_small = textures
+            .load(&ctx, url, egui::TextureOptions::LINEAR, SizeHint::Width(64))
+            .unwrap();
+        let TexturePoll::Ready { texture } = repeated_small else {
+            panic!("the larger texture remains ready")
+        };
+        assert_eq!(texture.id, first_id);
+        assert_eq!(texture_size(&ctx, first_id), [512, 512]);
+        let entries = loader.inner.entries.lock().unwrap();
+        let entry = &entries[url];
+        assert_eq!(
+            entry.decoded.as_ref().unwrap().as_ref().unwrap().size,
+            [512, 512]
+        );
+        assert_eq!(entry.raster_bytes, decoded_and_texture_bytes(512, 512));
+        drop(entries);
+
+        drop(textures);
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        runtime.shutdown_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn larger_inflight_demand_coalesces_and_failed_upgrade_does_not_spin() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotidark-art-sized-state-{}-{}",
+            std::process::id(),
+            request_id()
+        ));
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        let ctx = egui::Context::default();
+        let inflight = "https://i.scdn.co/image/inflight";
+        loader.inner.entries.lock().unwrap().insert(
+            inflight.into(),
+            Entry {
+                decoding: Some(DecodeRequest {
+                    id: request_id(),
+                    target: RasterTarget::Bucket(128),
+                }),
+                ..Entry::default()
+            },
+        );
+        assert!(matches!(
+            loader
+                .poll_decoded(&ctx, inflight, SizeHint::Width(300))
+                .unwrap(),
+            DecodedPoll::Pending { .. }
+        ));
+        assert_eq!(
+            loader.inner.entries.lock().unwrap()[inflight].pending_target,
+            Some(RasterTarget::Bucket(512))
+        );
+        let _ = loader.poll_decoded(&ctx, inflight, SizeHint::Width(200));
+        assert_eq!(
+            loader.inner.entries.lock().unwrap()[inflight].pending_target,
+            Some(RasterTarget::Bucket(512)),
+            "smaller demand cannot replace the queued upgrade"
+        );
+
+        let failed = "https://i.scdn.co/image/failed-upgrade";
+        let image = Arc::new(egui::ColorImage::filled([128, 128], egui::Color32::BLUE));
+        loader.inner.entries.lock().unwrap().insert(
+            failed.into(),
+            Entry {
+                decoded: Some(Ok(Arc::clone(&image))),
+                completed_target: Some(RasterTarget::Bucket(128)),
+                decoded_revision: 7,
+                failed_target: Some(RasterTarget::Bucket(512)),
+                raster_bytes: decoded_and_texture_bytes(128, 128),
+                ..Entry::default()
+            },
+        );
+        for _ in 0..2 {
+            let DecodedPoll::Ready {
+                image: still_small,
+                revision,
+                ..
+            } = loader
+                .poll_decoded(&ctx, failed, SizeHint::Width(300))
+                .unwrap()
+            else {
+                panic!("failed upgrade must preserve its existing raster")
+            };
+            assert!(Arc::ptr_eq(&image, &still_small));
+            assert_eq!(revision, 7);
+        }
+        let entries = loader.inner.entries.lock().unwrap();
+        assert!(entries[failed].decoding.is_none());
+        assert!(
+            entries[failed].request.is_none(),
+            "suppressed failures must not restart the byte pipeline"
+        );
+        assert_eq!(
+            entries[failed].failed_target,
+            Some(RasterTarget::Bucket(512))
+        );
+        drop(entries);
+
+        let request = request_id();
+        let generation = loader.inner.graphics_generation.load(Ordering::Acquire);
+        loader
+            .inner
+            .entries
+            .lock()
+            .unwrap()
+            .get_mut(failed)
+            .unwrap()
+            .decoding = Some(DecodeRequest {
+            id: request,
+            target: RasterTarget::Bucket(1024),
+        });
+        loader.inner.complete_decode(
+            failed,
+            request,
+            RasterTarget::Bucket(1024),
+            generation,
+            Err("same malformed payload".into()),
+        );
+        for width in [300, 700, 300, 700] {
+            assert!(matches!(
+                loader.poll_decoded(&ctx, failed, SizeHint::Width(width)),
+                Ok(DecodedPoll::Ready { .. })
+            ));
+        }
+        let entries = loader.inner.entries.lock().unwrap();
+        assert!(entries[failed].decoding.is_none());
+        assert!(
+            entries[failed].request.is_none(),
+            "alternating suppressed failures must not restart byte loading"
+        );
+        assert_eq!(
+            entries[failed].failed_target,
+            Some(RasterTarget::Bucket(1024)),
+            "alternating smaller failed demands stay suppressed"
+        );
+        assert!(Arc::ptr_eq(
+            &image,
+            entries[failed].decoded.as_ref().unwrap().as_ref().unwrap()
+        ));
+        drop(entries);
+
+        runtime.shutdown_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn waiting_upgrade_keeps_encoded_bytes_until_a_decoder_owns_the_work() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotidark-art-waiting-upgrade-{}-{}",
+            std::process::id(),
+            request_id()
+        ));
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        let ctx = egui::Context::default();
+        let url = "https://i.scdn.co/image/waiting-upgrade";
+        let bytes = png(640, 640);
+        loader.inner.entries.lock().unwrap().insert(
+            url.into(),
+            Entry {
+                bytes: Some(Arc::clone(&bytes)),
+                decoded: Some(Ok(Arc::new(egui::ColorImage::filled(
+                    [128, 128],
+                    egui::Color32::BLUE,
+                )))),
+                completed_target: Some(RasterTarget::Bucket(128)),
+                decoded_revision: 1,
+                raster_bytes: decoded_and_texture_bytes(128, 128),
+                ..Entry::default()
+            },
+        );
+        let permits = runtime.block_on(async {
+            loader
+                .inner
+                .decode_jobs
+                .clone()
+                .acquire_many_owned(DECODE_JOBS as u32)
+                .await
+                .unwrap()
+        });
+        let textures = loader.texture_loader();
+        let TexturePoll::Ready { .. } = textures
+            .load(
+                &ctx,
+                url,
+                egui::TextureOptions::LINEAR,
+                SizeHint::Width(300),
+            )
+            .unwrap()
+        else {
+            panic!("the existing texture stays available")
+        };
+        let entries = loader.inner.entries.lock().unwrap();
+        let entry = &entries[url];
+        assert_eq!(entry.bytes.as_deref(), Some(&*bytes));
+        assert_eq!(entry.pending_target, Some(RasterTarget::Bucket(512)));
+        assert!(entry.decoding.is_none());
+        drop(entries);
+        drop(permits);
+        drop(textures);
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        runtime.shutdown_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     async fn wait_for_artwork_file(path: &std::path::Path, expected: &[u8]) {
@@ -1080,6 +1857,9 @@ mod tests {
         let image = Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::RED));
         let mut entry = Entry {
             decoded: Some(Ok(image.clone())),
+            completed_target: Some(RasterTarget::Full),
+            decoded_full: true,
+            decoded_revision: 1,
             raster_bytes: decoded_and_texture_bytes(4, 4),
             ..Entry::default()
         };
@@ -1252,6 +2032,24 @@ mod tests {
         assert!(lyrics_background(b"broken artwork").is_none());
     }
 
+    #[test]
+    fn releasing_a_lyrics_backdrop_drops_its_texture_and_pending_result() {
+        let ctx = egui::Context::default();
+        let mut backdrop = LyricsBackdrop::default();
+        backdrop.seed_pending_for_test();
+        backdrop.texture = Some(ctx.load_texture(
+            "backdrop-release-test",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        ));
+
+        backdrop.release_graphics();
+
+        assert!(backdrop.is_released_for_test());
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+    }
+
     /// The media controls ask for a file rather than a URL, and have to be
     /// told "not yet" rather than handed a path to nothing: macOS loads cover
     /// art itself and dereferences a failed load without checking it, which
@@ -1267,6 +2065,7 @@ mod tests {
             reqwest::Client::new(),
             runtime.handle().clone(),
             dir.clone(),
+            crate::backend::Waker::default().downgrade(),
         );
         let url = "https://i.scdn.co/image/abc";
 
@@ -1295,6 +2094,7 @@ mod tests {
             reqwest::Client::new(),
             runtime.handle().clone(),
             dir.clone(),
+            crate::backend::Waker::default().downgrade(),
         );
         let ctx = egui::Context::default();
         let url = "https://i.scdn.co/image/never-drawn";
@@ -1409,6 +2209,89 @@ mod tests {
     }
 
     #[test]
+    fn releasing_graphics_keeps_encoded_and_disk_art_and_rejects_stale_decode() {
+        let dir = std::env::temp_dir().join(format!(
+            "fastpotify-art-release-{}-{}",
+            std::process::id(),
+            request_id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runtime = artwork_test_runtime();
+        let loader = artwork_test_loader(&runtime, dir.clone());
+        let url = "https://i.scdn.co/image/release";
+        let encoded: Arc<[u8]> = Arc::from(&b"encoded-art"[..]);
+        let path = loader.inner.cache_path(url);
+        std::fs::create_dir_all(path.parent().expect("cache directory")).unwrap();
+        std::fs::write(&path, &*encoded).unwrap();
+        let request = request_id();
+        let target = RasterTarget::Bucket(64);
+        let generation = loader.inner.graphics_generation.load(Ordering::Acquire);
+        loader.inner.entries.lock().expect("entries").insert(
+            url.to_string(),
+            Entry {
+                request: Some(41),
+                bytes: Some(Arc::clone(&encoded)),
+                error: Some("a later byte reload failed".into()),
+                decoded: Some(Ok(Arc::new(egui::ColorImage::new(
+                    [1, 1],
+                    vec![egui::Color32::WHITE],
+                )))),
+                decoding: Some(DecodeRequest {
+                    id: request,
+                    target,
+                }),
+                raster_bytes: 8,
+                ..Entry::default()
+            },
+        );
+
+        loader.release_graphics();
+
+        {
+            let entries = loader.inner.entries.lock().expect("entries");
+            let entry = &entries[url];
+            assert_eq!(entry.bytes.as_deref(), Some(&*encoded));
+            assert_eq!(entry.request, Some(41));
+            assert!(entry.error.is_none());
+            assert!(entry.decoded.is_none());
+            assert!(entry.decoding.is_none());
+            assert_eq!(entry.raster_bytes, 0);
+        }
+        assert_eq!(loader.cached_file(url), Some(path));
+
+        // Even if a later request reused this entry, a completion from the
+        // released graphics generation cannot publish its pixels.
+        loader
+            .inner
+            .entries
+            .lock()
+            .expect("entries")
+            .get_mut(url)
+            .expect("entry")
+            .decoding = Some(DecodeRequest {
+            id: request,
+            target,
+        });
+        loader.inner.complete_decode(
+            url,
+            request,
+            target,
+            generation,
+            Ok((
+                Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+                true,
+            )),
+        );
+        assert!(
+            loader.inner.entries.lock().expect("entries")[url]
+                .decoded
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn large_covers_evict_using_decoded_and_texture_sizes() {
         let one = decoded_and_texture_bytes(640, 640);
         assert_eq!(one, 2 * 640 * 640 * 4);
@@ -1428,6 +2311,7 @@ mod tests {
             reqwest::Client::new(),
             runtime.handle().clone(),
             dir.clone(),
+            crate::backend::Waker::default().downgrade(),
         );
         let now = Instant::now();
         for i in 0..40 {
@@ -1449,7 +2333,14 @@ mod tests {
         for i in 0..40 {
             let url = format!("https://i.scdn.co/image/{i}");
             loader.release_bytes(&url);
-            loader.note_decoded(&url, 640, 640);
+            loader
+                .inner
+                .entries
+                .lock()
+                .expect("lock")
+                .get_mut(&url)
+                .expect("entry")
+                .raster_bytes = one;
         }
         let before = retained_total(&loader);
         assert_eq!(before, 40 * one);
@@ -1502,6 +2393,7 @@ mod tests {
             reqwest::Client::new(),
             runtime.handle().clone(),
             dir.clone(),
+            crate::backend::Waker::default().downgrade(),
         );
         let url = "https://i.scdn.co/image/reload";
         let path = loader.inner.cache_path(url);

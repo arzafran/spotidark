@@ -37,6 +37,12 @@ on macOS and Windows, or lets you choose full or reduced motion explicitly.
 On Linux, choose reduced motion in the app. Reduced motion removes movement
 and scaling while retaining useful color feedback.
 
+Artwork is sized for the display's pixel density and upgrades when a larger
+view needs it. Closing to the tray releases window graphics while keeping
+playback, library metadata, and downloaded artwork available.
+While hidden, the app wakes for events and scheduled background work instead of
+polling every 150 milliseconds. Playback and desktop controls remain available.
+
 ## Build and run
 
 Spotidark's release workflow builds a universal macOS DMG and a Windows x64

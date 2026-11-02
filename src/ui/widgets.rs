@@ -54,15 +54,6 @@ pub fn paint_cover(
         else {
             return false;
         };
-        if let Some(art) = art {
-            art.release_bytes(url);
-            art.note_decoded(
-                url,
-                texture.size.x.round() as usize,
-                texture.size.y.round() as usize,
-            );
-        }
-
         let image_aspect = texture.size.x / texture.size.y;
         let rect_aspect = rect.width() / rect.height();
         let uv = if image_aspect > rect_aspect {

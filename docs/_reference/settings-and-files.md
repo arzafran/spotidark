@@ -130,6 +130,23 @@ artwork retention budget accounts for encoded bytes, decoded pixels and the
 estimated texture size together. Visible artwork remains protected. Oversized
 or invalid artwork leaves a placeholder; it does not block playback.
 
+Display artwork uses physical-pixel size buckets, including Retina scaling,
+and keeps one largest decoded image per URL. A larger view upgrades the existing
+texture while the smaller image remains visible; a smaller view reuses it.
+Original encoded files remain unchanged for media controls, accents and lyrics.
+The decoder still reads the full source image before resizing, so this reduces
+retained pixels rather than eliminating temporary full-resolution decoding.
+Closing to the tray releases decoded display artwork and the lyrics backdrop.
+Late decodes cannot restore the retired window's graphics. Reopening uses the
+existing disk cache without clearing library metadata or interrupting playback.
+
+While hidden, Spotidark waits for playback, command and worker events or the
+next background deadline instead of polling every 150 milliseconds. Existing
+Spotify refresh intervals, delayed saves and cache maintenance remain active.
+On Linux, media controls still publish position updates once a second while
+playback advances. On macOS and Windows, command-line position queries advance
+from a timestamped snapshot without requiring a periodic application tick.
+
 The following Liked Songs caching behavior is on `main`, for the release
 since 0.8.0.
 
@@ -147,6 +164,11 @@ In Spotidark, the displayed Liked Songs list and save checkpoints share the
 canonical song metadata. Cache reads and writes stream through small buffers
 on background workers. Existing version 1 cache files remain readable, and a
 failed write preserves the previous cache.
+
+Collection tables reuse cached sorting and playlist-position mappings. Ordinary
+frames access visible rows by index instead of rebuilding a projection of every
+loaded row. Filtering, sorting and unavailable playlist entries keep their
+existing behavior.
 
 The last good playlist folder tree is kept in `session.json`, scoped to the
 account that supplied it. This keeps folders visible when local playback is

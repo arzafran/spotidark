@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use ksni::blocking::TrayMethods;
 
+use crate::backend::Waker;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayCommand {
     Show,
@@ -160,10 +162,37 @@ impl TrayService {
     pub fn hidden(&mut self) {}
 }
 
-/// Waits while the app lives in the tray without a window. Linux has
-/// nothing to pump here: the tray and MPRIS run on their own threads.
-pub fn idle(duration: Duration) {
-    std::thread::sleep(duration);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    Wake,
+    Deadline,
+}
+
+/// A scoped wait target for the interval where no egui window exists.
+pub struct HiddenWaiter {
+    waker: Waker,
+}
+
+impl HiddenWaiter {
+    pub fn new(waker: &Waker) -> Self {
+        Self {
+            waker: waker.clone(),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.waker.generation()
+    }
+
+    /// Linux's tray and media services own their own threads, so their wakes
+    /// can block here without pumping a platform event loop.
+    pub fn wait(&self, observed: u64, duration: Duration) -> WaitReason {
+        if self.waker.wait_for_change(observed, duration) {
+            WaitReason::Wake
+        } else {
+            WaitReason::Deadline
+        }
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +202,20 @@ mod tests {
     use std::process::{Command, Stdio};
 
     struct Watcher(Sender<String>);
+
+    #[test]
+    fn hidden_waiter_observes_a_wake_published_before_waiting() {
+        let waker = Waker::default();
+        let waiter = HiddenWaiter::new(&waker);
+        let observed = waiter.generation();
+
+        waker.wake();
+
+        assert_eq!(
+            waiter.wait(observed, Duration::from_secs(1)),
+            WaitReason::Wake
+        );
+    }
 
     #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
     impl Watcher {
